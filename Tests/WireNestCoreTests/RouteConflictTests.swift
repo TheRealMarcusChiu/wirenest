@@ -50,12 +50,7 @@ final class RouteConflictTests: XCTestCase {
         XCTAssertEqual(try kinds(v4, v6), [])
     }
 
-    func testDefaultRouteConflictsWithAnotherTunnelsSpecificRoute() throws {
-        let a = confText(address: "10.1.0.2/32", allowedIPs: "0.0.0.0/0")
-        let b = confText(address: "192.168.9.2/32", allowedIPs: "10.2.0.0/24")
-        XCTAssertTrue(try kinds(a, b).contains(.overlappingRoutes))
-        XCTAssertTrue(try kinds(b, a).contains(.overlappingRoutes), "order must not matter")
-
+    func testIPv6DefaultRouteConflictsWithAnotherTunnelsSpecificRoute() throws {
         let v6a = confText(address: "fd01::2/128", allowedIPs: "::/0", endpoint: "[2001:db8::1]:51820")
         let v6b = confText(address: "fd02::2/128", allowedIPs: "fd03::/64", endpoint: "[2001:db8::2]:51820")
         XCTAssertTrue(try kinds(v6a, v6b).contains(.overlappingRoutes))
@@ -68,20 +63,10 @@ final class RouteConflictTests: XCTestCase {
         XCTAssertTrue(try kinds(a, b).contains(.overlappingRoutes))
     }
 
-    func testDefaultRouteConflictsWithAnotherTunnelsAddressAlone() throws {
-        let v4 = confText(address: "10.1.0.2/32", allowedIPs: "0.0.0.0/0")
-        let b = confText(address: "10.2.0.2/32", allowedIPs: "fd02::/64", endpoint: "[2001:db8::2]:51820")
-        XCTAssertEqual(try kinds(v4, b), [.overlappingRoutes])
-
-        let v6 = confText(address: "fd01::2/128", allowedIPs: "::/0", endpoint: "[2001:db8::1]:51820")
+    func testIPv6DefaultRouteConflictsWithAnotherTunnelsAddressAlone() throws {
+        let v6 =confText(address: "fd01::2/128", allowedIPs: "::/0", endpoint: "[2001:db8::1]:51820")
         let c = confText(address: "fd02::2/128", allowedIPs: "10.2.0.0/24", endpoint: "198.51.100.1:51820")
         XCTAssertEqual(try kinds(v6, c), [.overlappingRoutes])
-    }
-
-    func testDefaultRouteCapturesAnotherTunnelsEndpoint() throws {
-        let v4 = confText(address: "10.1.0.2/32", allowedIPs: "0.0.0.0/0")
-        let v6Only = confText(address: "fd02::2/128", allowedIPs: "fd02::/64", endpoint: "198.51.100.9:51820")
-        XCTAssertEqual(try kinds(v4, v6Only), [.endpointCaptured])
     }
 
     func testHostnameEndpointBesideADefaultRouteFailsClosedAcrossFamiliesInBothOrders() throws {
@@ -123,7 +108,7 @@ final class RouteConflictTests: XCTestCase {
         var state = AppState()
         let profile = state.addProfile(name: "p")
         let full = try state.importTunnel(text: confText(address: "10.1.0.2/32", allowedIPs: "0.0.0.0/0"), name: "full", into: profile).tunnelID
-        let outcome = try state.importTunnel(text: confText(address: "192.168.9.2/32", allowedIPs: "10.2.0.0/24"), name: "lab", into: profile)
+        let outcome = try state.importTunnel(text: confText(address: "192.168.9.2/32", allowedIPs: "128.0.0.0/1"), name: "lab", into: profile)
         XCTAssertFalse(state.tunnel(outcome.tunnelID)!.enabled)
         XCTAssertTrue(outcome.conflicts.map(\.kind).contains(.overlappingRoutes))
 
@@ -143,12 +128,6 @@ final class RouteConflictTests: XCTestCase {
         let a = confText(address: "10.1.0.2/32", extraInterface: "Table = off", allowedIPs: "0.0.0.0/0")
         let b = confText(address: "10.2.0.2/32", allowedIPs: "10.2.0.0/24")
         XCTAssertEqual(try kinds(a, b), [])
-    }
-
-    func testTableOffStillHasAnAddressThatADefaultRouteCovers() throws {
-        let a = confText(address: "10.1.0.2/32", extraInterface: "Table = off", allowedIPs: "0.0.0.0/0")
-        let b = confText(address: "10.2.0.2/32", allowedIPs: "0.0.0.0/0")
-        XCTAssertTrue(try kinds(a, b).contains(.overlappingRoutes))
     }
 
     func testOverlappingInterfaceAddressesConflict() throws {

@@ -128,25 +128,58 @@ Error messages never echo values.
 
 Checked per pair in input order, and refused by default:
 
-- overlapping `AllowedIPs` or `Address` across tunnels, where a `/0` overlaps every route and address
-  of its family in another tunnel;
+- overlapping `AllowedIPs` or `Address` across tunnels, including an IPv6 `/0` against that family's routes
+  and addresses, and an IPv4 `/0` against a `/1` or an address no narrower than `/1`;
 - two owners of the same family's `/0`;
-- an IP-literal endpoint inside another tunnel's routes, including its `/0`;
+- an IP-literal endpoint inside another tunnel's routes, except its IPv4 `/0`, which is conditional below;
 - the same `ListenPort`.
 
 Disabled tunnels are ignored. `Table = off` installs no routes, so its `AllowedIPs` are exempt, but its
 addresses are still checked.
 
-There is deliberately no exception for a full tunnel beside a split tunnel. wg-quick installs `/0` as
-two `/1` routes, so longest-prefix match cannot decide against another `/1`, and each tunnel's wg-quick
-manages its endpoint routes alone.
-
-A hostname endpoint beside another tunnel's `/0` is refused in either family, because the name could
-resolve into that route. Only a numeric endpoint of the other family can prove it stays out. The root
-helper runs the same check.
+A hostname endpoint or a peer with no endpoint beside another tunnel's `/0` is refused in either family,
+because it could arrive inside that route. The default owner's own hostname is fine: wg-quick pins its own
+endpoint. The root helper runs the same check.
 
 **Limits.** Hostname endpoints are not checked against narrower routes, since they cannot be resolved
 ahead of time. Conflicts with routes outside WireNest are not detected.
+
+### One IPv4 full tunnel beside narrower tunnels
+
+wg-quick installs an IPv4 `/0` as two `/1` routes, so a narrower route of another tunnel wins by
+longest-prefix match. `assessRoutes` therefore separates definite conflicts from `exposures`, which are
+allowed only if proved on the running system. The app saves and enables such a pair, and the root helper
+decides whether it can really run. There is no blanket exemption, and no route is ever added to make it safe.
+
+The danger is the narrower tunnel's encrypted traffic being captured by the full tunnel. So each of its
+endpoints, in the default route's family, must have an existing route that is more specific than `/1` and
+outside every helper-owned interface. `EndpointRouteProof` reads `route -n get`, `netstat -rn`, `ifconfig -a`
+and `networksetup -listallhardwareports`, through fixed paths with timeouts, and requires all of this:
+
+- the ordinary unscoped lookup is not a reject, blackhole or gateway route, and its interface is not ours;
+- that interface is `UP` and `RUNNING` and either really `LOOPBACK`, or listed as a hardware port, not
+  point-to-point, and not inactive. Not being ours is not evidence of being physical;
+- the interface's own address and mask give a connected network (`/2` to `/31`) containing the endpoint, and
+  the table has an unscoped cloning row for exactly that network on that interface;
+- the lookup is that connected route itself, or a cached or local host entry under it. A host entry alone
+  proves nothing, and neither does a `/32` row.
+
+Anything unknown, malformed or ambiguous is a refusal.
+
+**When it is checked.** Before a start and before any root action, then again after `wg-quick` returns and
+before `running`, when the kernel must also show the `/1` rows on the new interface and each narrower route
+in effect, polled for up to 5 seconds. On a failure only the new tunnel is retired, through the normal
+cleanup. The check also runs on every status poll, on same-config `up` and on helper start, using the
+actual endpoints from `wg show … endpoints`, so a roamed endpoint is what gets proved. An unknown endpoint is
+a refusal. If the proof is lost, the full tunnel is retired while the narrower tunnel and DNS continue, the
+reason is reported in `routeFailure`, and a cleanup that cannot finish stays journaled and is retried. The
+app then retries the full tunnel with its usual backoff, and each attempt is refused until the proof holds.
+
+**Limits.** This is not a kill switch: traffic is not blocked while the full tunnel is stopped, and between
+checks an endpoint could briefly be captured. A network change that briefly removes the connected route stops
+the full tunnel until the route returns, which interrupts it. An endpoint reached through a router, not a
+connected network, is refused even if it would work. `::/0` has no such exception, and the check only covers
+IPv4 endpoints.
 
 ### SSID eligibility
 
@@ -291,6 +324,7 @@ act on it. Other changes to saved state from a rule are committed only with a su
 | `NetworkPolicyTests` | SSID eligibility, pause and resume against the real engine, older state decoding, import DNS seeding |
 | `SupervisorTests` | Backoff, per-peer health, per-tunnel restarts, no storms, adoption |
 | `HelperEngineTests` | Argv and file hygiene, boundary validation, DNS lifecycle, crash and boot recovery, install protocol |
+| `EndpointRouteProofTests` | Assessment of the full-plus-narrow pair, replay of observed Darwin output with labelled synthetic mutations, read-only real commands, root preflight, postflight, loss of proof and recovery |
 | `HelperLifecycleTests` | Teardown barrier, start verification, journal crash points, DNS retry and pending services, install staging race, smoke manifest |
 
 The app target and `Installer`, `ProcessRunner` and `Daemon` have no unit tests: they are OS adapters that
@@ -325,6 +359,11 @@ These rest on documentation or reasoning, not on execution:
 5. The Location prompt from an `LSUIElement` app, and `SMAppService.mainApp` with an ad-hoc signature.
 6. `requiredInterface` actually bypassing `wg-quick`'s split default routes.
 7. The UI's look, layout and behavior: none of it has been seen on screen.
+
+8. A real `0.0.0.0/0` tunnel beside a narrower one. Neither the unit tests nor the existing helper proof, which
+   stays on reserved addresses with no default route, install a default route. So the `netstat` format of the
+   `/1` rows, how the route monitor behaves with them, and the proof with them in place are all unobserved,
+   and need a disposable network or a real Mac.
 
 ## Known limitations
 

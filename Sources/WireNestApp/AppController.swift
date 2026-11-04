@@ -31,6 +31,8 @@ final class AppController: ObservableObject {
     @Published private(set) var dnsError: String?
     /// Why a matching rule cannot use its connection right now.
     @Published private(set) var ruleProblem: String?
+    /// Why the helper stopped a default-route tunnel: another tunnel's endpoint lost its protecting route.
+    @Published private(set) var routeFailure: String?
     @Published private(set) var isBusy = false
 
     var showPreferences: () -> Void = {}
@@ -186,6 +188,7 @@ final class AppController: ObservableObject {
             return
         }
         helperState = .ready
+        routeFailure = status.routeFailure
 
         refreshSSID()
         let desired: [DesiredTunnel]

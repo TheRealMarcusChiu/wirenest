@@ -72,6 +72,8 @@ public struct HelperStatus: Codable, Equatable {
     public let dnsManaged: Bool
     /// Network services whose original DNS servers still wait to be restored.
     public let dnsPendingServices: [String]
+    /// Why a default-route tunnel was stopped or is being stopped: another tunnel's endpoint lost its protecting route.
+    public let routeFailure: String?
 }
 
 public struct HelperResponse: Codable, Equatable {

@@ -187,7 +187,7 @@ private struct ProfileDetail: View {
                     Button("Delete") { controller.removeTunnel(tunnel.id) }
                 }
             }
-            Text("Tunnels with overlapping routes cannot be on together. A tunnel using the default route (0.0.0.0/0 or ::/0) needs that whole IP family to itself, including other tunnels' addresses and endpoints.")
+            Text("Tunnels with overlapping routes cannot be on together. One tunnel using 0.0.0.0/0 can run beside tunnels with narrower IPv4 routes, but only while each of their endpoints has a Wi-Fi, Ethernet or loopback route more specific than that tunnel's routes. WireNest checks this on the Mac while connected, adds no routes of its own, and stops the 0.0.0.0/0 tunnel if that route goes away. A tunnel using ::/0 needs all of IPv6 to itself. This is not a kill switch.")
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

@@ -56,6 +56,8 @@ public final class HelperEngine {
         var name: String
         var phase: Phase
         var interface: String?
+        /// Set when route enforcement is taking this tunnel down, so that cleanup keeps being retried and reported.
+        var proofFailure: String?
     }
 
     private struct Session: Codable {
@@ -67,11 +69,13 @@ public final class HelperEngine {
     private static let pollInterval: TimeInterval = 0.25
     private static let cleanupPolls = 80
     private static let retryCleanupPolls = 20
+    private static let routeReadyPolls = 20
 
     private let paths: HelperPaths
     private let runner: CommandRunning
     private let dns: DNSManager
     private var session = Session()
+    private var routeFailure: String?
 
     private var sessionURL: URL { paths.runtimeDir.appendingPathComponent("session.json") }
 
@@ -87,6 +91,7 @@ public final class HelperEngine {
         do {
             switch request {
             case .status:
+                enforceRouteProofs()
                 return HelperResponse(status: currentStatus())
             case .up(let id, let config):
                 try up(id, configText: config)
@@ -119,6 +124,7 @@ public final class HelperEngine {
             if entry.phase == .running, realInterface(entry.name).map(isInterfaceAlive) == true { continue }
             try? retire(id, polls: Self.cleanupPolls)
         }
+        enforceRouteProofs()
         if session.tunnels.isEmpty { try? dns.restore() }
     }
 
@@ -143,7 +149,13 @@ public final class HelperEngine {
         let config = try WireGuardConfig.parse(configText)
         if let entry = session.tunnels[id] {
             if entry.phase == .running, runningConfig(entry.name)?.fingerprint == config.fingerprint,
-               realInterface(entry.name).map(isInterfaceAlive) == true { return }
+               realInterface(entry.name).map(isInterfaceAlive) == true {
+                enforceRouteProofs()
+                guard session.tunnels[id]?.phase == .running else {
+                    throw SecureFileError(routeFailure ?? "This tunnel was stopped because its routes are no longer safe.")
+                }
+                return
+            }
             try down(id)
         }
 
@@ -156,8 +168,12 @@ public final class HelperEngine {
         let others = session.tunnels.values.map(\.name).sorted().compactMap { name in
             runningConfig(name).map { NamedConfig(name: name, config: $0) }
         }
-        let conflicts = findRouteConflicts(others + [NamedConfig(name: "new tunnel", config: config)])
-        if !conflicts.isEmpty { throw RouteConflictError(conflicts: conflicts) }
+        let newName = "new tunnel"
+        let assessment = assessRoutes(others + [NamedConfig(name: newName, config: config)])
+        if !assessment.conflicts.isEmpty { throw RouteConflictError(conflicts: assessment.conflicts) }
+        for exposure in assessment.exposures where exposure.tunnel == newName || exposure.defaultOwner == newName {
+            if let failure = endpointProofFailure(exposure) { throw SecureFileError(failure) }
+        }
 
         let used = Set(session.tunnels.values.map(\.name))
         guard let name = HelperConstants.slotNames.first(where: { !used.contains($0) }) else {
@@ -182,6 +198,7 @@ public final class HelperEngine {
         do {
             guard result.status == 0 else { throw SecureFileError("wg-quick up failed: \(tail(result.output))") }
             session.tunnels[id]?.interface = try verifiedInterface(name, config: config)
+            try waitForSafeRoutes(of: name)
             session.tunnels[id]?.phase = .running
             try saveSession()
         } catch {
@@ -208,6 +225,102 @@ public final class HelperEngine {
             throw SecureFileError("wg-quick reported success, but its route monitor is not running.")
         }
         return real
+    }
+
+    // MARK: Default-route safety
+
+    /// A tunnel running beside a default-route tunnel is safe only while its endpoints are proven to stay outside it.
+    private func endpointProofFailure(_ exposure: EndpointExposure) -> String? {
+        let endpoints: [String]
+        if let real = realInterface(exposure.tunnel) {
+            // A dead tunnel sends nothing to capture. Its own restart is checked again on the way up.
+            guard isInterfaceAlive(real) else { return nil }
+            let result = runner.run(paths.wg, ["show", real, "endpoints"], timeout: 5, readyMarker: nil)
+            guard result.status == 0, let actual = parseWgEndpoints(result.output) else {
+                return unsafeRouteMessage("a tunnel's endpoint", reason: "its current endpoint is unknown")
+            }
+            endpoints = actual
+        } else {
+            endpoints = exposure.configuredEndpoints
+        }
+
+        let owned = Set(session.tunnels.values.compactMap { realInterface($0.name) ?? $0.interface })
+        for endpoint in endpoints where CIDR(endpoint)?.isIPv6 == exposure.isIPv6 {
+            if exposure.isIPv6 {
+                return unsafeRouteMessage(endpoint, reason: "IPv6 endpoints cannot be proved")
+            }
+            if let reason = EndpointRouteProof.refusal(endpoint: endpoint, ownedInterfaces: owned, runner: runner) {
+                return unsafeRouteMessage(endpoint, reason: reason)
+            }
+        }
+        return nil
+    }
+
+    private func unsafeRouteMessage(_ endpoint: String, reason: String) -> String {
+        "Cannot safely run this tunnel beside the default-route tunnel: no proven physical-LAN or loopback route to \(endpoint) more specific than its /1 routes (\(reason)). No protective route was added."
+    }
+
+    /// A running device and a ready marker say nothing about routes. A new tunnel of a pair runs only once
+    /// the kernel shows its routes in effect and every endpoint is still proven with them in place.
+    private func waitForSafeRoutes(of name: String) throws {
+        let named = session.tunnels.values.filter { $0.phase != .retiring }.map(\.name).sorted().compactMap { name in
+            runningConfig(name).map { NamedConfig(name: name, config: $0) }
+        }
+        let exposures = assessRoutes(named).exposures.filter { $0.tunnel == name || $0.defaultOwner == name }
+        guard !exposures.isEmpty else { return }
+
+        var failure: String?
+        for poll in 0...Self.routeReadyPolls {
+            failure = routeEffectFailure(exposures) ?? exposures.compactMap { endpointProofFailure($0) }.first
+            if failure == nil { return }
+            if poll < Self.routeReadyPolls { runner.pause(Self.pollInterval) }
+        }
+        throw SecureFileError(failure ?? "The new tunnel's routes could not be confirmed.")
+    }
+
+    private func routeEffectFailure(_ exposures: [EndpointExposure]) -> String? {
+        let participants = Set(exposures.filter { !$0.isIPv6 }.flatMap { [$0.tunnel, $0.defaultOwner] })
+        for name in participants.sorted() {
+            guard let config = runningConfig(name), config.table != .off, let real = realInterface(name) else { continue }
+            let routes = config.peers.flatMap(\.allowedIPs).filter { !$0.isIPv6 }
+            if routes.contains(where: \.isDefaultRoute) {
+                let table = EndpointRouteProof.readRoutingTable(runner)
+                guard table.status == 0, EndpointRouteProof.defaultExpansionsInstalled(netstat: table.output, on: real) else {
+                    return "The default-route tunnel's routes did not appear on \(real). It was stopped."
+                }
+            }
+            for route in routes where !route.isDefaultRoute {
+                guard EndpointRouteProof.lookupInterface(route.address, runner: runner) == real else {
+                    return "The route \(route) is not in effect on \(real). The tunnel was stopped."
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Run on every status poll and helper start, so losing the protecting route stops the default-route tunnel while the
+    /// other tunnel and DNS continue. The app then retries it with backoff, and each attempt is refused until safe again.
+    private func enforceRouteProofs() {
+        for (id, entry) in session.tunnels where entry.phase == .retiring && entry.proofFailure != nil {
+            try? retire(id, polls: Self.retryCleanupPolls)
+        }
+        routeFailure = session.tunnels.values.compactMap(\.proofFailure).first
+
+        let running = session.tunnels.filter { $0.value.phase == .running }
+        let named = running.values.map(\.name).sorted().compactMap { name in
+            runningConfig(name).map { NamedConfig(name: name, config: $0) }
+        }
+        for exposure in assessRoutes(named).exposures {
+            guard let ownerID = session.tunnels.first(where: { $0.value.name == exposure.defaultOwner && $0.value.phase == .running })?.key,
+                  let failure = endpointProofFailure(exposure) else { continue }
+            routeFailure = failure
+            session.tunnels[ownerID]?.proofFailure = failure
+            do {
+                try retire(ownerID, polls: Self.cleanupPolls)
+            } catch {
+                routeFailure = "\(failure) Stopping the default-route tunnel is incomplete and will be retried: \(error.localizedDescription)"
+            }
+        }
     }
 
     private func down(_ id: UUID) throws {
@@ -293,7 +406,7 @@ public final class HelperEngine {
         }
         return HelperStatus(
             protocolVersion: HelperConstants.protocolVersion, tunnels: tunnels,
-            dnsManaged: dns.isManaging, dnsPendingServices: dns.pendingServices
+            dnsManaged: dns.isManaging, dnsPendingServices: dns.pendingServices, routeFailure: routeFailure
         )
     }
 

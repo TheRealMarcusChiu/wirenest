@@ -11,6 +11,50 @@ final class FakeCommands: CommandRunning {
         var wgReachable = true
         var monitorAlive = true
         var pausesUntilGone: Int?
+        var config: WireGuardConfig?
+        var defaultRowsAtPause = 0
+    }
+
+    /// Synthetic: shaped like B4's observed Darwin output, but this LAN and these rows were never observed.
+    var routeGet: [String: CommandResult] = [:]
+    var netstatBase = "Routing tables\n\nInternet:\nDestination        Gateway            Flags               Netif Expire\n"
+    var ifconfigAll = ""
+    var hardwarePorts = ""
+    var actualEndpoints: [String: String] = [:]
+    var defaultRowsAppearAfterPauses = 0
+
+    func installSyntheticLAN() {
+        netstatBase = """
+        Routing tables
+
+        Internet:
+        Destination        Gateway            Flags               Netif Expire
+        default            192.168.86.1       UGScg                 en0
+        127                127.0.0.1          UCS                   lo0
+        192.168.86         link#7             UCS                   en0      !
+
+        """
+        ifconfigAll = """
+        lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+        \tinet 127.0.0.1 netmask 0xff000000
+        en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+        \tinet 192.168.86.20 netmask 0xffffff00 broadcast 192.168.86.255
+        \tstatus: active
+
+        """
+        hardwarePorts = "\nHardware Port: Wi-Fi\nDevice: en0\nEthernet Address: 00:00:00:00:00:01\n"
+        routeGet = ["192.168.86.51": CommandResult(status: 0, output: """
+           route to: 192.168.86.51
+        destination: 192.168.86.0
+               mask: 255.255.255.0
+          interface: en0
+              flags: <UP,DONE,CLONING,STATIC>
+        """)]
+    }
+
+    private func slotName(forRoute address: String) -> String? {
+        guard let target = CIDR(address) else { return nil }
+        return slots.first { $0.value.config?.peers.flatMap(\.allowedIPs).contains { !$0.isDefaultRoute && $0.overlaps(target) } == true }?.key
     }
 
     var calls: [(executable: String, args: [String])] = []
@@ -75,7 +119,10 @@ final class FakeCommands: CommandRunning {
                 let real = "utun\(nextUtun)"
                 try? "\(real)\n".write(to: nameFile, atomically: true, encoding: .utf8)
                 try? Data().write(to: paths.wireguardRunDir.appendingPathComponent("\(real).sock"))
-                slots[name] = Slot(real: real, pgid: 1000 + Int32(nextUtun), monitorAlive: !upWithoutMonitor)
+                var slot = Slot(real: real, pgid: 1000 + Int32(nextUtun), monitorAlive: !upWithoutMonitor)
+                slot.config = (try? String(contentsOfFile: conf, encoding: .utf8)).flatMap { try? WireGuardConfig.parse($0) }
+                slot.defaultRowsAtPause = pauses + defaultRowsAppearAfterPauses
+                slots[name] = slot
                 nextUtun += 1
                 return CommandResult(status: 0, output: "[+] Backgrounding route monitor")
             }
@@ -101,8 +148,34 @@ final class FakeCommands: CommandRunning {
             switch args.last {
             case "latest-handshakes": return CommandResult(status: 0, output: "\(testKey(2))\t1700000000\n")
             case "transfer": return CommandResult(status: 0, output: "\(testKey(2))\t11\t22\n")
+            case "endpoints":
+                guard let name = slots.first(where: { $0.value.real == args[1] })?.key else { return CommandResult(status: 1, output: "") }
+                if let actual = actualEndpoints[name] { return CommandResult(status: 0, output: actual) }
+                let peers = slots[name]?.config?.peers ?? []
+                return CommandResult(status: 0, output: peers.map { "\($0.publicKey)\t\($0.endpoint?.text ?? "(none)")\n" }.joined())
             default: return CommandResult(status: 1, output: "")
             }
+        }
+        if executable == "/sbin/route" {
+            let address = args.last ?? ""
+            if let scripted = routeGet[address] { return scripted }
+            if let name = slotName(forRoute: address), let real = slots[name]?.real {
+                return CommandResult(status: 0, output: "   route to: \(address)\n  interface: \(real)\n      flags: <UP,DONE,STATIC>\n")
+            }
+            return CommandResult(status: 1, output: "route: writing to routing socket: not in table")
+        }
+        if executable == "/usr/sbin/netstat" {
+            let rows = slots.values.filter { slot in
+                pauses >= slot.defaultRowsAtPause && slot.config?.table != .off
+                    && slot.config?.peers.flatMap(\.allowedIPs).contains { $0.isDefaultRoute && !$0.isIPv6 } == true
+            }.map { "0/1                \($0.real)              USc                 \($0.real)\n128.0/1            \($0.real)              USc                 \($0.real)\n" }
+            return CommandResult(status: 0, output: netstatBase + rows.joined())
+        }
+        if executable == "/usr/sbin/networksetup", args == ["-listallhardwareports"] {
+            return CommandResult(status: 0, output: hardwarePorts)
+        }
+        if executable == "/sbin/ifconfig", args == ["-a"] {
+            return CommandResult(status: 0, output: ifconfigAll)
         }
         if executable == "/sbin/ifconfig" {
             if ifconfigBroken { return CommandResult(status: 124, output: "Timed out") }
