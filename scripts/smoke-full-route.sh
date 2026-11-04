@@ -251,6 +251,14 @@ class AliasTrace:
         self.gateway, self.interface, self.clock = gateway, interface, clock
         self.index, self.start = 0, None
         self.aliases = {tunnel["alias"]: {"records": [], "overflow": 0, "routes": None, "presence": None} for tunnel in (A, B)}
+        self.unavailable = 0
+
+    def observe_safely(self, *args):
+        """Holds only this diagnostic. Captures and proof checks stay outside it, and signals pass through."""
+        try:
+            self.observe(*args)
+        except Exception:
+            self.unavailable += 1
 
     def observe(self, phase, routes_text, ifaces_text=None):
         now = self.clock()
@@ -286,6 +294,8 @@ class AliasTrace:
                 print(f"alias-route {alias} {record}", file=stream)
             if trace["overflow"]:
                 print(f"alias-route {alias} overflow={trace['overflow']} transitions dropped", file=stream)
+        if self.unavailable:
+            print(f"alias-route unavailable={self.unavailable} observations", file=stream)
         stream.flush()
 
 
@@ -855,9 +865,9 @@ def sample(evidence, wg, trace):
     try:
         routes = run_read([NETSTAT, "-rnf", "inet"], limit=3)
     except ProofError:
-        trace.observe("app", "")
+        trace.observe_safely("app", "")
     else:
-        trace.observe("app", routes)
+        trace.observe_safely("app", routes)
         try:
             evidence.add_routes(parse_routes(routes))
         except ProofError:
@@ -881,7 +891,7 @@ def run_case(order, ctx, fail):
             if rc != 0:
                 raise ProofError(f"could not lease {tunnel['alias']}: {text.strip()}")
         raw = capture()
-        trace.observe("before-startup", raw["routes"], raw["ifaces"])
+        trace.observe_safely("before-startup", raw["routes"], raw["ifaces"])
         for tunnel in (A, B):
             problem = alias_problem(raw, tunnel["alias"])
             if problem:
@@ -932,7 +942,7 @@ def run_case(order, ctx, fail):
 
         def routes_after_app():
             routes = run_read([NETSTAT, "-rnf", "inet"])
-            trace.observe("after-app", routes)
+            trace.observe_safely("after-app", routes)
             return routes
 
         def stop_watchdog():
@@ -957,7 +967,7 @@ def run_case(order, ctx, fail):
                     fail(f"{order}: could not remove {alias}: {text.strip()}")
 
         def compare_baseline():
-            leftover = wait_restored(ctx["baseline"], observer=lambda raw: trace.observe("after-cleanup", raw["routes"], raw["ifaces"]))
+            leftover = wait_restored(ctx["baseline"], observer=lambda raw: trace.observe_safely("after-cleanup", raw["routes"], raw["ifaces"]))
             if leftover is not None:
                 fail(f"{order}: the network did not return to its baseline:\n{leftover}")
             else:
@@ -1710,8 +1720,9 @@ def self_test_case_reporting():
         def poll(self):
             return None
 
-    def run(name, app_status, app_output, raises=None):
+    def run(name, app_status, app_output, raises=None, trace_class=None, read_error=None):
         steps = []
+        after_app_captures = []
 
         def fake_run_app(_cmd, _env, out, err, _deadline, tick):
             steps.append("app")
@@ -1730,7 +1741,11 @@ def self_test_case_reporting():
 
         def fake_wait_gone(reader=None, **_kwargs):
             steps.append("gone")
-            reader()
+            if read_error:
+                def broken_read(*_a, **_k):
+                    raise read_error
+                globals()["run_read"] = broken_read
+            after_app_captures.append(reader())
             return True
 
         def fake_restored(_baseline, observer=None, **_kwargs):
@@ -1754,6 +1769,8 @@ def self_test_case_reporting():
             "arm_watchdog": lambda *_a, **_k: time.monotonic(), "run_app": fake_run_app, "run_read": lambda *_a, **_k: during,
             "wait_full_routes_gone": fake_wait_gone, "wait_restored": fake_restored, "stop_peer": fake_stop, "disarm_watchdog": fake_disarm,
         }
+        if trace_class:
+            fakes["AliasTrace"] = trace_class
         saved = {key: globals()[key] for key in fakes}
         real_popen, real_stdout, real_stderr = subprocess.Popen, sys.stdout, sys.stderr
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryFile("w+") as out_stream, tempfile.TemporaryFile("w+") as err_stream:
@@ -1773,7 +1790,9 @@ def self_test_case_reporting():
                 globals().update(saved)
                 subprocess.Popen, sys.stdout, sys.stderr = real_popen, real_stdout, real_stderr
             err_stream.seek(0)
-            return {"steps": steps, "failures": failures, "stderr": err_stream.read(), "interrupted": interrupted}
+            out_stream.seek(0)
+            return {"steps": steps, "failures": failures, "stderr": err_stream.read(), "stdout": out_stream.read(),
+                    "interrupted": interrupted, "after_app_captures": after_app_captures}
 
     # The app fails, so app_verdict raises before evidence.failures() is reached.
     failed = run("failed", 1, b"First tunnel carries traffic.\n")
@@ -1799,6 +1818,63 @@ def self_test_case_reporting():
     # A signal during the window: no failure recorded yet, but it is one, so the trace still prints.
     stopped = run("stopped", 0, b"", raises=SystemExit(143))
     assert stopped["interrupted"] and "alias-route" in stopped["stderr"] and stopped["steps"][-1] == "restored", stopped
+
+    # A broken observer, in any phase, changes nothing: same steps, same verdict, same capture, and no text of its own.
+    secret = "SECRET-OBSERVER-TEXT 203.0.113.77"
+
+    def raising_trace(error, phases):
+        class RaisingTrace(AliasTrace):
+            def observe(self, phase, *args):
+                if phases is None or phase in phases:
+                    raise error(secret)
+                super().observe(phase, *args)
+        return RaisingTrace
+
+    for error in (RuntimeError, ValueError, OSError, ProofError):
+        for phases in ({"after-app"}, {"before-startup"}, {"app"}, {"after-cleanup"}, None):
+            label = (error.__name__, phases)
+            bad = run("observer-failed", 1, b"First tunnel carries traffic.\n", trace_class=raising_trace(error, phases))
+            assert bad["failures"] == ["split-first: the app exited 1"], (label, bad["failures"])
+            assert bad["steps"] == expected, (label, bad["steps"])
+            assert bad["after_app_captures"] == [during], label
+            assert "alias-route unavailable=" in bad["stderr"], (label, bad["stderr"])
+            good = run("observer-passed", 0, b"FULL_ROUTE_SMOKE_PASSED split-first\n", trace_class=raising_trace(error, phases))
+            assert good["failures"] == [], (label, good["failures"])
+            assert good["steps"] == expected and good["after_app_captures"] == [during], (label, good["steps"])
+            assert "alias-route" not in good["stderr"], (label, good["stderr"])
+            for result in (bad, good):
+                assert not any("SECRET" in text or "203.0.113" in text for text in (result["stderr"], result["stdout"], *result["failures"])), (label, result)
+
+    # The rest of the trace survives one broken phase.
+    partial = run("partial", 1, b"", trace_class=raising_trace(ValueError, {"after-app"}))
+    assert "before-startup presence=lo0-/32" in partial["stderr"] and "alias-route unavailable=1 observations" in partial["stderr"], partial["stderr"]
+
+    # Only ordinary exceptions are absorbed. A signal is not one, in the boundary or in a real case.
+    for error in (SystemExit, KeyboardInterrupt):
+        trace = raising_trace(error, None)("192.168.64.1", "en0")
+        try:
+            trace.observe_safely("app", FIXTURE_ROUTES)
+        except error:
+            pass
+        else:
+            raise AssertionError(f"{error.__name__} was swallowed")
+        assert trace.unavailable == 0
+    signalled = run("signalled", 0, b"", trace_class=raising_trace(SystemExit, {"app"}))
+    assert signalled["interrupted"] and signalled["steps"][-1] == "restored" and "alias-route" in signalled["stderr"], signalled
+
+    # The boundary holds only the observation: a failed authoritative capture still reaches the proof, and isn't counted as one.
+    capture_broke = run("capture-error", 0, b"FULL_ROUTE_SMOKE_PASSED split-first\n", read_error=ProofError("capture broke"))
+    assert any("capture broke" in failure for failure in capture_broke["failures"]), capture_broke["failures"]
+    assert "alias-route unavailable" not in capture_broke["stderr"], capture_broke["stderr"]
+
+    # The report had its own boundary already. It must stay in place.
+    class BrokenReport(AliasTrace):
+        def report(self, stream=None):
+            raise RuntimeError(secret)
+
+    broken = run("broken-report", 1, b"", trace_class=BrokenReport)
+    assert broken["failures"] == ["split-first: the app exited 1"] and broken["steps"] == expected, broken
+    assert "alias-route report unavailable: RuntimeError" in broken["stderr"] and "SECRET" not in broken["stderr"], broken["stderr"]
 
 
 def self_test():
