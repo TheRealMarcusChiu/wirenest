@@ -175,6 +175,181 @@ def check_install(uid, cdhash):
         sys.exit("error: the installed client pin does not name this user and this exact app build")
 
 
+def snapshot_dns(text):
+    # Everything but `reach`, a live reachability result rather than configuration. Order and
+    # resolver numbering stay, because they decide which server answers.
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines or not lines[0].startswith("DNS configuration") or not any(line.startswith("resolver #") for line in lines):
+        sys.exit("error: scutil --dns output has no resolver configuration")
+    return ["dns " + line for line in lines if not re.match(r"reach\s*:", line)]
+
+
+def snapshot_routes(text):
+    lines = text.splitlines()
+    header = next((i for i, line in enumerate(lines) if line.split()[:2] == ["Destination", "Gateway"]), None)
+    if header is None or "Flags" not in lines[header].split() or "Netif" not in lines[header].split():
+        sys.exit("error: netstat output has no route table header")
+    columns = lines[header].split()
+    flags, netif = columns.index("Flags"), columns.index("Netif")
+    rows = [line.split() for line in lines[header + 1:] if line.strip()]
+    if not rows:
+        sys.exit("error: netstat output has no routes")
+    # Expire is dropped: it is a countdown. All flags stay; this range is normally empty.
+    routes = []
+    for row in rows:
+        if re.match(r"198\.1[89](\.|/|%|$)", row[0]):
+            if len(row) <= max(flags, netif):
+                sys.exit(f"error: netstat route {row[0]} is missing columns")
+            routes.append(f"route {row[0]} {row[1]} {row[flags]} {row[netif]}")
+    return sorted(routes)
+
+
+def snapshot_default(text):
+    fields = re.findall(r"^\s*(destination|gateway|interface):\s*(\S+)", text, re.M)
+    if {"destination", "interface"} - {name for name, _ in fields}:
+        sys.exit("error: route output has no default destination and interface")
+    return [f"default {name} {value}" for name, value in fields]
+
+
+def snapshot_interfaces(names, stanzas):
+    names = names.split()
+    if not names:
+        sys.exit("error: ifconfig -l listed no interfaces")
+    found, current = [], None
+    for line in stanzas.splitlines():
+        stanza = re.match(r"(\S+): flags=", line)
+        if stanza:
+            current = stanza.group(1)
+        inet = re.match(r"\s+inet (198\.1[89]\.\S+)", line)
+        if inet:
+            found.append(f"address {current} {inet.group(1)}")
+    if current is None:
+        sys.exit("error: ifconfig -a output has no interfaces")
+    return sorted(found) + sorted("utun " + name for name in names if name.startswith("utun"))
+
+
+def snapshot_text(dns, routes, default, iflist, ifaces):
+    lines = snapshot_default(default) + snapshot_dns(dns) + snapshot_routes(routes) + snapshot_interfaces(iflist, ifaces)
+    return "\n".join(lines) + "\n"
+
+
+def snapshot(dest):
+    parts = [read(f"{dest}.{part}").decode(errors="replace") for part in ("dns", "routes", "default", "iflist", "ifaces")]
+    text = snapshot_text(*parts)  # Parse first, so a bad capture never leaves a baseline behind.
+    with open(dest, "w") as f:
+        f.write(text)
+
+
+FIXTURE_DNS = """DNS configuration
+
+resolver #1
+  search domain[0] : corp.example
+  nameserver[0] : 192.0.2.53
+  nameserver[1] : 192.0.2.54
+  if_index : 6 (en0)
+  flags    : Request A records
+  reach    : 0x00000002 (Reachable)
+
+DNS configuration (for scoped queries)
+
+resolver #1
+  nameserver[0] : 192.0.2.53
+  if_index : 6 (en0)
+  flags    : Scoped, Request A records
+  reach    : 0x00000002 (Reachable)
+"""
+FIXTURE_ROUTES = """Routing tables
+
+Internet:
+Destination        Gateway            Flags               Netif Expire
+default            192.0.2.1          UGScg                 en0
+198.18.5/24        192.0.2.9          UGSc                  en0
+198.18.6.7         link#6             UHLWI                 en0      42
+"""
+FIXTURE_DEFAULT = """   route to: default
+destination: default
+       mask: default
+    gateway: 192.0.2.1
+  interface: en0
+"""
+FIXTURE_IFLIST = "lo0 en0 utun0 utun1\n"
+FIXTURE_IFACES = """lo0: flags=8049<UP,LOOPBACK> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+en0: flags=8863<UP,RUNNING> mtu 1500
+\tinet 192.0.2.10 netmask 0xffffff00
+utun1: flags=8051<UP,POINTOPOINT> mtu 1280
+\tinet 198.18.5.1 --> 198.18.5.1 netmask 0xffffffff
+"""
+FIXTURES = {"dns": FIXTURE_DNS, "routes": FIXTURE_ROUTES, "default": FIXTURE_DEFAULT, "iflist": FIXTURE_IFLIST, "ifaces": FIXTURE_IFACES}
+
+
+def snapshot_fixtures(tmp):
+    for part, text in FIXTURES.items():
+        write_private(os.path.join(tmp, "fixture." + part), text)
+
+
+def self_test_snapshot():
+    def taken(**changes):
+        return snapshot_text(**dict(FIXTURES, **changes))
+
+    def rejected(**changes):
+        try:
+            taken(**changes)
+        except SystemExit:
+            return True
+        return False
+
+    def changed(text, old, new):
+        assert old in text, old
+        return text.replace(old, new)
+
+    base = taken()
+    assert "198.18.5/24 192.0.2.9 UGSc en0" in base and "utun utun1" in base and "address utun1 198.18.5.1" in base
+
+    # The nameserver set is identical in the first three, so a set comparison would miss them.
+    for label, changes in (
+        ("search domain", {"dns": changed(FIXTURE_DNS, "corp.example", "evil.example")}),
+        ("server order", {"dns": FIXTURE_DNS.replace("[0] : 192.0.2.53\n  nameserver[1] : 192.0.2.54", "[0] : 192.0.2.54\n  nameserver[1] : 192.0.2.53", 1)}),
+        ("scope", {"dns": changed(FIXTURE_DNS, "Scoped, Request", "Request")}),
+        ("interface association", {"dns": changed(FIXTURE_DNS, "6 (en0)", "9 (utun1)")}),
+        ("new server", {"dns": changed(FIXTURE_DNS, "192.0.2.54", "192.0.2.55")}),
+        ("route gateway", {"routes": changed(FIXTURE_ROUTES, "192.0.2.9 ", "192.0.2.8 ")}),
+        ("route interface", {"routes": changed(FIXTURE_ROUTES, "UGSc                  en0", "UGSc                  utun1")}),
+        ("route flags", {"routes": changed(FIXTURE_ROUTES, "UGSc ", "UGS  ")}),
+        ("added route", {"routes": FIXTURE_ROUTES + "198.19.1/24 192.0.2.9 UGSc en0\n"}),
+        ("default gateway", {"default": changed(FIXTURE_DEFAULT, "192.0.2.1", "192.0.2.2")}),
+        ("default interface", {"default": changed(FIXTURE_DEFAULT, "en0", "utun1")}),
+        ("added utun", {"iflist": FIXTURE_IFLIST + "utun2\n"}),
+        ("reserved address moved", {"ifaces": changed(FIXTURE_IFACES, "utun1:", "utun2:")}),
+    ):
+        assert taken(**changes) != base, label
+
+    # Only what the parser documents as volatile or irrelevant may compare equal.
+    for label, changes in (
+        ("reach", {"dns": FIXTURE_DNS.replace("0x00000002 (Reachable)", "0x00000000 (Not Reachable)")}),
+        ("route expiry", {"routes": changed(FIXTURE_ROUTES, "      42", "      17")}),
+        ("unrelated route", {"routes": FIXTURE_ROUTES + "10.1/16 192.0.2.1 UGSc en0\n"}),
+        ("other interface address", {"ifaces": changed(FIXTURE_IFACES, "192.0.2.10", "192.0.2.11")}),
+        ("column layout", {"routes": changed(FIXTURE_ROUTES, "Gateway            Flags", "Gateway  RT_IFA  Flags").replace("192.0.2.9          ", "192.0.2.9 192.0.2.10 ").replace("link#6             ", "link#6 192.0.2.10 ").replace("192.0.2.1          ", "192.0.2.1 192.0.2.10 ")}),
+    ):
+        assert taken(**changes) == base, label
+
+    for label, changes in (
+        ("empty dns", {"dns": ""}),
+        ("no dns", {"dns": "No DNS configuration available\n"}),
+        ("dns header only", {"dns": "DNS configuration\n"}),
+        ("empty routes", {"routes": ""}),
+        ("no route header", {"routes": "Internet:\ndefault 192.0.2.1 UGScg en0\n"}),
+        ("header without rows", {"routes": "Destination Gateway Flags Netif Expire\n"}),
+        ("short reserved route", {"routes": "Destination Gateway Flags Netif Expire\n198.18.5/24 192.0.2.9\n"}),
+        ("empty default", {"default": ""}),
+        ("default without interface", {"default": "destination: default\n"}),
+        ("empty interface list", {"iflist": ""}),
+        ("empty interface stanzas", {"ifaces": ""}),
+    ):
+        assert rejected(**changes), label
+
+
 def self_test():
     def outcome(function, *args, **kwargs):
         try:
@@ -183,6 +358,7 @@ def self_test():
         except SystemExit:
             return False
 
+    self_test_snapshot()
     fake_wg = ["/bin/sh", "-c", 'case "$1" in pubkey) cat >/dev/null;; esac; head -c 32 /dev/urandom | base64', "wg"]
     with tempfile.TemporaryDirectory() as tmp:
         fixtures(tmp, fake_wg)
@@ -258,6 +434,10 @@ elif command == "drive":
     drive(args[0], [args[1]])
 elif command == "check-install":
     check_install(args[0], args[1])
+elif command == "snapshot":
+    snapshot(args[0])
+elif command == "snapshot-fixtures":
+    snapshot_fixtures(args[0])
 elif command == "self-test":
     self_test()
 else:
@@ -265,13 +445,189 @@ else:
 PY
 }
 
+py() { python3 -I "$tmp/harness.py" "$@"; }
+
+# Every capture must succeed and parse, or there is no snapshot at all: an empty baseline
+# would compare equal to an empty result.
+network_snapshot() {
+  scutil --dns >"$1.dns" &&
+    netstat -rnf inet >"$1.routes" &&
+    route -n get -inet default >"$1.default" &&
+    ifconfig -l >"$1.iflist" &&
+    ifconfig -a >"$1.ifaces" &&
+    py snapshot "$1"
+}
+
+peer_stop_ticks=50 # of 0.1s, per signal
+stopped_by=none
+
+# gone, exited (our unreaped zombie), alive (our running child), foreign (the PID now belongs
+# to another process, so ours is long gone), or unknown (ps itself failed).
+peer_state() {
+  local fields status=0 ppid stat
+  fields=$(ps -o ppid= -o stat= -p "$1" 2>/dev/null) || status=$?
+  if [[ -z $fields ]]; then
+    if [[ $status -eq 1 ]]; then echo gone; else echo unknown; fi
+    return 0
+  fi
+  read -r ppid stat <<<"$fields"
+  if [[ $ppid != "$$" ]]; then
+    echo foreign
+  elif [[ $stat == Z* ]]; then
+    echo exited
+  else
+    echo alive
+  fi
+}
+
+peer_exit_wait() {
+  local ticks=$peer_stop_ticks
+  while [[ $(peer_state "$1") == alive ]]; do
+    [[ $ticks -gt 0 ]] || return 1
+    ticks=$((ticks - 1))
+    sleep 0.1
+  done
+}
+
+# Succeeds only once the child is confirmed gone. Signals only a live child of this shell.
+stop_peer() {
+  local pid=$1 state
+  stopped_by=none
+  if [[ $(peer_state "$pid") == alive ]]; then
+    kill -s TERM "$pid" 2>/dev/null || true
+    stopped_by=TERM
+    if ! peer_exit_wait "$pid"; then
+      kill -s KILL "$pid" 2>/dev/null || true
+      stopped_by=KILL
+      peer_exit_wait "$pid" || return 1
+    fi
+  fi
+  state=$(peer_state "$pid")
+  # wait would block forever on a child that is still running.
+  [[ $state != alive && $state != unknown ]] || return 1
+  # A nonzero status is expected here: this is the signal we just sent.
+  wait "$pid" 2>/dev/null || true
+  state=$(peer_state "$pid")
+  [[ $state == gone || $state == foreign ]]
+}
+
+stop_peers() {
+  local pid status=0
+  for pid in $peer_pids; do
+    stop_peer "$pid" || {
+      echo "error: could not confirm that smoke peer $pid stopped" >&2
+      status=1
+    }
+  done
+  return "$status"
+}
+
+self_test_shell() {
+  local child orphan first name
+  # start_child TRAP: a real child of this shell, once its signal handling is in place.
+  start_child() {
+    rm -f "$tmp/ready"
+    bash -c "$1"'; : >"$0"; while :; do sleep 0.1; done' "$tmp/ready" </dev/null >/dev/null 2>&1 &
+    child=$!
+    local ticks=100
+    until [[ -e $tmp/ready ]]; do
+      [[ $ticks -gt 0 ]] || die "self-test: child did not start"
+      ticks=$((ticks - 1))
+      sleep 0.1
+    done
+  }
+  end_child() {
+    unset -f kill ps 2>/dev/null || true
+    kill -s KILL "$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+  }
+  peer_stop_ticks=30
+
+  # Real owned processes.
+  sleep 0 </dev/null >/dev/null 2>&1 &
+  child=$!
+  peer_exit_wait "$child" || die "self-test: child did not exit"
+  stop_peer "$child" || die "self-test: normal exit was not confirmed"
+  [[ $stopped_by == none ]] || die "self-test: signalled a child that had already exited"
+
+  start_child 'trap "sleep 0.5; exit 0" TERM'
+  stop_peer "$child" || die "self-test: delayed TERM was not confirmed"
+  [[ $stopped_by == TERM ]] || die "self-test: delayed TERM escalated to $stopped_by"
+  [[ $(peer_state "$child") == gone ]] || die "self-test: delayed TERM child remains"
+
+  peer_stop_ticks=5
+  start_child 'trap "" TERM'
+  stop_peer "$child" || die "self-test: TERM-ignoring child was not stopped"
+  [[ $stopped_by == KILL ]] || die "self-test: TERM-ignoring child ended by $stopped_by"
+  [[ $(peer_state "$child") == gone ]] || die "self-test: TERM-ignoring child remains"
+
+  # A real process that is not this shell's child must not be signalled.
+  orphan=$(bash -c 'sleep 30 </dev/null >/dev/null 2>&1 & echo $!')
+  stop_peer "$orphan" || die "self-test: an unrelated PID failed the stop"
+  [[ $stopped_by == none ]] || die "self-test: signalled a process this shell does not own"
+  [[ $(peer_state "$orphan") == foreign ]] || die "self-test: unrelated process did not survive"
+  kill -s KILL "$orphan"
+
+  # Simulated failures: real children, with the failing command replaced by a function.
+  start_child 'trap "" TERM'
+  kill() { return 0; }
+  if stop_peer "$child"; then die "self-test: passed with a child that could not be signalled"; fi
+  [[ $stopped_by == KILL ]] || die "self-test: did not escalate before giving up"
+  end_child
+
+  start_child 'trap "" TERM'
+  ps() { return 2; }
+  if stop_peer "$child"; then die "self-test: passed with no way to observe the child"; fi
+  end_child
+
+  start_child 'trap "exit 0" TERM'
+  first=$child
+  start_child 'trap "" TERM'
+  kill() { if [[ $3 == "$child" ]]; then return 0; fi; command kill "$@"; }
+  peer_pids="$first $child"
+  if stop_peers 2>/dev/null; then die "self-test: stop_peers hid a failure"; fi
+  [[ $(peer_state "$first") == gone ]] || die "self-test: one failure skipped the other peer"
+  end_child
+  peer_pids=""
+  peer_stop_ticks=50
+
+  # Fixture captures, with the system commands replaced by functions.
+  py snapshot-fixtures "$tmp"
+  capture_fail=none
+  fixture_capture() {
+    if [[ $capture_fail == "$1" ]]; then return 3; fi
+    cat "$tmp/fixture.$2"
+  }
+  scutil() { fixture_capture scutil dns; }
+  netstat() { fixture_capture netstat routes; }
+  route() { fixture_capture route default; }
+  ifconfig() {
+    if [[ $1 == -l ]]; then fixture_capture ifconfig-l iflist; else fixture_capture ifconfig-a ifaces; fi
+  }
+  network_snapshot "$tmp/good" || die "self-test: a good capture was rejected"
+  [[ -s $tmp/good ]] || die "self-test: a good capture wrote nothing"
+  for name in scutil netstat route ifconfig-l ifconfig-a; do
+    capture_fail=$name
+    if network_snapshot "$tmp/failed" 2>/dev/null || [[ -e $tmp/failed ]]; then
+      die "self-test: a failed $name capture produced a snapshot"
+    fi
+  done
+  capture_fail=none
+  : >"$tmp/fixture.dns"
+  if network_snapshot "$tmp/failed" 2>/dev/null || [[ -e $tmp/failed ]]; then
+    die "self-test: an empty scutil capture produced a snapshot"
+  fi
+  unset -f scutil netstat route ifconfig fixture_capture start_child end_child
+}
+
 if [[ $# -eq 1 && $1 == --self-test ]]; then
   umask 077
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
   write_harness "$tmp/harness.py"
-  python3 -I "$tmp/harness.py" self-test >/dev/null
-  echo "ok: helper smoke fixtures and verdict logic (no helper, routing or macOS involved)"
+  py self-test >/dev/null
+  self_test_shell
+  echo "ok: helper smoke fixtures, verdict logic, snapshot parsing and peer stopping (no helper, routing or macOS involved)"
   exit 0
 fi
 
@@ -308,14 +664,6 @@ cdhash=$(codesign -dv --verbose=4 "$app" 2>&1 | awk -F= '$1 == "CDHash" {print $
 [[ -n $cdhash ]] || die "could not read the app's code directory hash"
 sudo -n true || die "passwordless sudo is required"
 
-route_field() { { route -n get -inet "$1" 2>/dev/null || true; } | awk -v f="$2:" '$1 == f {print $2}'; }
-network_snapshot() {
-  { route -n get -inet default 2>/dev/null || true; } | awk '$1 == "destination:" || $1 == "gateway:" || $1 == "interface:"'
-  scutil --dns | awk '/nameserver\[/ {print $3}' | sort -u
-  netstat -rnf inet | awk '$1 ~ /^198\.1[89](\.|\/|$)/ {print $1}' | sort -u
-  ifconfig -a | awk '$1 == "inet" && $2 ~ /^198\.1[89]\./ {print $2}' | sort -u
-  ifconfig -l | tr ' ' '\n' | { grep '^utun' || true; } | sort
-}
 helper_removed() {
   local path
   if launchctl print "system/$launchd_label" >/dev/null 2>&1; then return 1; fi
@@ -326,10 +674,15 @@ helper_removed() {
 
 helper_removed || die "a WireNest helper is already installed; refusing to disturb it"
 for octet in 71 72; do
-  case $(route_field "198.18.$octet.2" destination) in
-    '' | default) ;;
-    *) die "198.18.$octet.0/24 is already routed on this machine; refusing to continue" ;;
-  esac
+  if route_output=$(route -n get -inet "198.18.$octet.2" 2>&1); then
+    # Only the default route may cover it; no destination at all means the check proved nothing.
+    case $(printf '%s\n' "$route_output" | awk '$1 == "destination:" {print $2}') in
+      default) ;;
+      *) die "198.18.$octet.0/24 is already routed on this machine; refusing to continue" ;;
+    esac
+  elif [[ $route_output != *"not in table"* ]]; then
+    die "could not check the route to 198.18.$octet.2: $route_output"
+  fi
 done
 
 tmp=$(mktemp -d)
@@ -339,7 +692,7 @@ install_attempted=0
 
 # The one exit path, so PASS can only be printed after uninstall and verified cleanup.
 cleanup() {
-  local rc=$? pid waited=0
+  local rc=$? waited=0 peers_stopped=1
   trap - EXIT INT TERM
   if [[ $install_attempted -eq 1 ]]; then
     sudo -n "$helper" --uninstall || {
@@ -347,11 +700,12 @@ cleanup() {
       rc=1
     }
   fi
-  for pid in $peer_pids; do
-    kill "$pid" 2>/dev/null || true
-  done
+  stop_peers || {
+    rc=1
+    peers_stopped=0
+  }
   if [[ -f $tmp/before ]]; then
-    until helper_removed && network_snapshot >"$tmp/after" && cmp -s "$tmp/before" "$tmp/after"; do
+    until helper_removed && network_snapshot "$tmp/after" && cmp -s "$tmp/before" "$tmp/after"; do
       waited=$((waited + 1))
       if [[ $waited -ge 20 ]]; then
         echo "error: helper state, routes, interfaces or DNS were not restored after ${waited}s:" >&2
@@ -363,7 +717,11 @@ cleanup() {
       sleep 1
     done
   fi
-  rm -rf "$tmp" || rc=1
+  if [[ $peers_stopped -eq 1 ]]; then
+    rm -rf "$tmp" || rc=1
+  else
+    echo "error: keeping $tmp because a smoke peer may still be using it" >&2
+  fi
   if [[ $rc -eq 0 ]]; then
     echo "HELPER SMOKE PASSED: authenticated app-to-root path, helper uninstalled, network state restored."
     echo "Not covered: the GUI, DNS management with real DNS settings, real hardware."
@@ -377,9 +735,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 write_harness "$tmp/harness.py"
-py() { python3 -I "$tmp/harness.py" "$@"; }
 
-network_snapshot >"$tmp/before"
+network_snapshot "$tmp/before" || die "could not capture the network baseline"
 py fixtures "$tmp" "$wg_tool"
 
 # Nothing is installed yet, so an app without the entrypoint fails here without touching root.
