@@ -45,35 +45,30 @@ struct HealthDot: View {
     var body: some View {
         Circle()
             .fill(health.color)
-            .frame(width: 8, height: 8)
+            .frame(width: 7, height: 7)
             .accessibilityHidden(true)
     }
 }
 
-/// Shared by the menu and Preferences: shows why something is not working and offers the next action.
-struct StatusBanners: View {
-    @ObservedObject var controller: AppController
+/// A row of a window-style menu, highlighted on hover the way a real menu item is.
+private struct MenuItemButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        MenuItemLabel(label: configuration.label)
+    }
 
-    var body: some View {
-        if case .needsInstall(let reason) = controller.helperState {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Helper needed").font(.headline)
-                Text("WireNest needs its privileged helper to control tunnels. macOS will ask for an administrator password.")
-                    .font(.caption)
-                Text(reason).font(.caption).foregroundColor(.secondary)
-                Button("Install or Update Helper…") { controller.installHelper() }
-            }
-        }
-        if let reason = controller.pauseReason {
-            Label("Paused: \(reason) It resumes on its own when allowed.", systemImage: "pause.circle")
-                .font(.caption)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        ForEach([controller.connectionError, controller.dnsError, controller.routeFailure, controller.ruleProblem, controller.notice].compactMap { $0 }, id: \.self) { message in
-            Text(message)
-                .font(.caption)
-                .foregroundColor(.red)
-                .fixedSize(horizontal: false, vertical: true)
+    private struct MenuItemLabel: View {
+        let label: ButtonStyleConfiguration.Label
+        @State private var isHovered = false
+
+        var body: some View {
+            label
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .foregroundColor(isHovered ? .white : .primary)
+                .background(isHovered ? Color.accentColor : Color.clear, in: RoundedRectangle(cornerRadius: 4))
+                .contentShape(Rectangle())
+                .onHover { isHovered = $0 }
         }
     }
 }
@@ -85,28 +80,16 @@ struct MenuContentView: View {
         controller.state.activeProfileID.flatMap { controller.state.profile($0) }
     }
 
-    private var hasErrors: Bool {
-        controller.notice != nil || controller.connectionError != nil || controller.dnsError != nil || controller.ruleProblem != nil || controller.routeFailure != nil
-            || controller.views.values.contains { $0.lastError != nil }
-    }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                HealthDot(health: controller.overallHealth)
-                Text("WireNest").font(.headline)
-                Spacer()
-                Text(controller.statusLabel).foregroundColor(.secondary)
-            }
-
-            StatusBanners(controller: controller)
+        VStack(alignment: .leading, spacing: 8) {
+            header
+            problemRow
 
             if controller.state.profiles.isEmpty {
-                Text("No connections yet. Open Preferences to create one and import a .conf file.")
-                    .font(.caption)
+                Text("No connections yet.")
                     .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
             } else {
+                Divider()
                 Picker("Connection", selection: Binding(
                     get: { controller.state.activeProfileID },
                     set: { id in if let id { controller.select(id) } }
@@ -116,53 +99,111 @@ struct MenuContentView: View {
                         Text(profile.name).tag(UUID?.some(profile.id))
                     }
                 }
-
-                Toggle("On", isOn: Binding(
-                    get: { controller.state.connectionOn },
-                    set: { on in
-                        if !on {
-                            controller.disconnect()
-                        } else if let id = controller.state.activeProfileID {
-                            controller.connect(id)
-                        }
-                    }
-                ))
-                .toggleStyle(.switch)
-                .disabled(controller.state.activeProfileID == nil)
+                .accessibilityIdentifier("menu.connection.picker")
             }
 
-            if let profile = activeProfile {
-                Divider()
+            if let profile = activeProfile, !profile.tunnels.isEmpty {
                 ForEach(profile.tunnels) { tunnel in
                     TunnelMenuRow(controller: controller, tunnel: tunnel, isOn: controller.state.connectionOn && controller.pauseReason == nil)
                 }
-                if profile.tunnels.isEmpty {
-                    Text("This connection has no tunnels yet.").font(.caption).foregroundColor(.secondary)
-                }
-            }
-
-            if hasErrors {
-                Button("Retry Now") { controller.retry() }
             }
 
             Divider()
-            Text(ssidLine).font(.caption).foregroundColor(.secondary)
+            Text(ssidLine)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
 
-            HStack {
-                Button("Preferences…") { controller.showPreferences() }
-                Spacer()
-                Button("Quit") { controller.quit() }
+            VStack(spacing: 0) {
+                Button("Settings…") {
+                    controller.preferencesPane = .connections
+                    controller.showPreferences()
+                }
+                .keyboardShortcut(",")
+                .accessibilityIdentifier("menu.settings")
+                Button("View Logs…") { controller.showLogs() }
+                    .accessibilityIdentifier("menu.logs")
+                Button("Quit WireNest") { controller.quit() }
+                    .keyboardShortcut("q")
                     .help("Disconnects tunnels and quits. A connection left on returns at next launch.")
+                    .accessibilityIdentifier("menu.quit")
             }
+            .buttonStyle(MenuItemButtonStyle())
         }
         .padding(12)
-        .frame(width: 320)
+        .frame(width: 300)
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Image(systemName: controller.overallHealth.symbol)
+                .foregroundColor(controller.overallHealth.color)
+                .font(.title3)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 0) {
+                Text("WireNest").font(.headline)
+                Text(controller.statusLabel)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .accessibilityIdentifier("menu.status")
+            }
+            Spacer()
+            Toggle("Connection", isOn: Binding(
+                get: { controller.state.connectionOn },
+                set: { on in
+                    if !on {
+                        controller.disconnect()
+                    } else if let id = controller.state.activeProfileID {
+                        controller.connect(id)
+                    }
+                }
+            ))
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .disabled(controller.state.activeProfileID == nil)
+            .accessibilityIdentifier("menu.connection.toggle")
+        }
+    }
+
+    /// One short line and the next action. The full text is one click away in the Logs pane.
+    @ViewBuilder
+    private var problemRow: some View {
+        if case .needsInstall = controller.helperState {
+            HStack {
+                Label("Helper not installed", systemImage: "exclamationmark.triangle.fill")
+                    .symbolRenderingMode(.multicolor)
+                    .font(.callout)
+                Spacer()
+                Button("Install…") { controller.installHelper() }
+                    .controlSize(.small)
+                    .accessibilityIdentifier("menu.helper.install")
+            }
+        } else if let summary = controller.problemSummary {
+            VStack(alignment: .leading, spacing: 4) {
+                Label(summary, systemImage: "exclamationmark.triangle.fill")
+                    .symbolRenderingMode(.multicolor)
+                    .font(.callout)
+                    .lineLimit(2)
+                    .accessibilityIdentifier("menu.problem")
+                HStack {
+                    Button("View Logs") { controller.showLogs() }
+                    Button("Retry") { controller.retry() }
+                        .accessibilityIdentifier("menu.retry")
+                }
+                .controlSize(.small)
+            }
+        } else if let reason = controller.pauseReason {
+            Label("Waiting for an allowed Wi-Fi network", systemImage: "pause.circle")
+                .font(.callout)
+                .foregroundColor(.secondary)
+                .help(reason)
+        }
     }
 
     private var ssidLine: String {
         switch controller.ssid {
         case .known(let name): return "Wi-Fi: \(name)"
-        case .unavailable(let reason): return "Wi-Fi name unavailable: \(reason)"
+        case .unavailable: return "Wi-Fi name unavailable"
         }
     }
 }
@@ -181,32 +222,35 @@ private struct TunnelMenuRow: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Toggle(isOn: Binding(
+        HStack(spacing: 8) {
+            HealthDot(health: health)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(tunnel.name).lineLimit(1)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .help(view?.lastError ?? "")
+            }
+            Spacer(minLength: 8)
+            Toggle(tunnel.name, isOn: Binding(
                 get: { tunnel.enabled },
                 set: { controller.setTunnelEnabled(tunnel.id, $0) }
-            )) {
-                HStack {
-                    HealthDot(health: health)
-                    Text(tunnel.name).lineLimit(1)
-                }
-            }
-            Text(detail)
-                .font(.caption2)
-                .foregroundColor(view?.lastError == nil ? .secondary : .red)
-                .fixedSize(horizontal: false, vertical: true)
+            ))
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlSize(.mini)
         }
         .accessibilityElement(children: .contain)
-        .accessibilityValue(health.label)
+        .accessibilityValue(detail)
+        .accessibilityIdentifier("menu.tunnel.\(tunnel.name)")
     }
 
     private var detail: String {
         if !tunnel.enabled { return "Off" }
         if controller.pauseReason != nil { return "Paused" }
-        if !isOn { return "Waiting for connection" }
-        var parts = [health.label]
-        if let text = view?.detail { parts.append(text) }
-        if let error = view?.lastError { parts.append(error) }
-        return parts.joined(separator: " · ")
+        if !isOn { return "Not connected" }
+        if let error = view?.lastError { return shortFailure(error) }
+        return health.label
     }
 }

@@ -80,7 +80,9 @@ public struct RuleEngine {
         let changedNow = observePublicIP(snapshot.publicIP, enabled: publicIPAllowed)
         targetProblem = nil
 
-        guard !state.manualOff else {
+        // The only gate needed, as this is the only way a rule acts. Tracking the address above means a change
+        // seen while off is the baseline afterwards, not an event. Pins and manual state are left exactly as they are.
+        guard state.rulesEnabled, !state.manualOff else {
             pending = nil
             publicIPChangePending = false
             return nil

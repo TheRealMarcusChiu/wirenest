@@ -16,9 +16,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showPreferences() {
         if preferences == nil {
             let window = NSWindow(contentViewController: NSHostingController(rootView: PreferencesView(controller: controller)))
-            window.title = "WireNest"
+            window.title = "WireNest Settings"
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             window.isReleasedWhenClosed = false
+            window.setContentSize(NSSize(width: 880, height: 600))
             window.center()
             preferences = window
         }

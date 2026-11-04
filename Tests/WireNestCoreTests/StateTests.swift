@@ -12,6 +12,92 @@ final class StateTests: XCTestCase {
         try state.importTunnel(text: text, name: name, into: profile).tunnelID
     }
 
+    // MARK: automation switch
+
+    func testAutomationSwitchSurvivesSaveAndLoad() throws {
+        let store = try StateStore(directory: tempDirectory().appendingPathComponent("s"))
+        var state = AppState()
+        XCTAssertTrue(state.rulesEnabled)
+        state.rulesEnabled = false
+        try store.save(state)
+        XCTAssertFalse(try store.load().rulesEnabled)
+        state.rulesEnabled = true
+        try store.save(state)
+        XCTAssertTrue(try store.load().rulesEnabled)
+    }
+
+    func testStateSavedBeforeTheAutomationSwitchLoadsWithRulesStillOn() throws {
+        let profile = UUID()
+        let legacy = """
+        {"profiles":[{"id":"\(profile)","name":"Old","primaryDNS":"","secondaryDNS":"","tunnels":[]}],
+        "connectionOn":false,"manualOff":false,
+        "rules":[{"id":"\(UUID())","enabled":true,"profileID":"\(profile)","condition":{"ssidEquals":{"_0":"Home"}}}],
+        "publicIPAutomationEnabled":false,"publicIPCheckURL":"https://api.ipify.org/"}
+        """
+        let store = try StateStore(directory: tempDirectory().appendingPathComponent("s"))
+        try Data(legacy.utf8).write(to: store.stateURL)
+        let loaded = try store.load()
+        XCTAssertTrue(loaded.rulesEnabled)
+        XCTAssertEqual(loaded.rules.count, 1)
+    }
+
+    // MARK: tunnel order
+
+    private func threeTunnels() throws -> (AppState, UUID, [UUID]) {
+        var (state, profile) = stateWithProfile()
+        var ids: [UUID] = []
+        for n in 1...3 {
+            ids.append(try importConf(&state, confText(address: "10.\(n).0.2/32", allowedIPs: "10.\(n).0.0/24"), into: profile, name: "t\(n)"))
+        }
+        return (state, profile, ids)
+    }
+
+    func testReorderingPersistsAndChangesNothingElse() throws {
+        var (state, profile, ids) = try threeTunnels()
+        try state.setTunnelEnabled(ids[1], false)
+        try state.setDNS(profile, primary: "9.9.9.9", secondary: "")
+        try state.connect(profile, pinContext: nil, ssid: noWiFi)
+        let before = state.profile(profile)!
+
+        let order = [ids[2], ids[0], ids[1]]
+        try state.reorderTunnels(in: profile, order)
+
+        let after = state.profile(profile)!
+        XCTAssertEqual(after.tunnels.map(\.id), order)
+        for tunnel in before.tunnels {
+            XCTAssertEqual(after.tunnels.first { $0.id == tunnel.id }, tunnel, "same identity, switch and config")
+        }
+        XCTAssertEqual(after.primaryDNS, "9.9.9.9")
+        XCTAssertEqual(state.activeProfileID, profile)
+        XCTAssertTrue(state.connectionOn)
+        XCTAssertEqual(try state.desiredTunnels(ssid: noWiFi).map(\.id), [ids[2], ids[0]], "the running order follows the stored one")
+
+        let store = try StateStore(directory: tempDirectory().appendingPathComponent("s"))
+        try store.save(state)
+        XCTAssertEqual(try store.load().profile(profile)?.tunnels.map(\.id), order)
+    }
+
+    func testReorderRefusesAnythingButAnExactPermutationAndChangesNothing() throws {
+        var (state, profile, ids) = try threeTunnels()
+        let other = state.addProfile(name: "Other")
+        let foreign = try importConf(&state, confText(address: "10.9.0.2/32", allowedIPs: "10.9.0.0/24"), into: other)
+        let before = state
+
+        for invalid in [
+            [ids[0], ids[1]],
+            [ids[0], ids[1], ids[2], ids[2]],
+            [ids[0], ids[1], ids[1]],
+            [ids[0], ids[1], foreign],
+            [ids[0], ids[1], UUID()],
+            [UUID]()
+        ] {
+            XCTAssertThrowsError(try state.reorderTunnels(in: profile, invalid))
+            XCTAssertEqual(state, before)
+        }
+        XCTAssertThrowsError(try state.reorderTunnels(in: UUID(), ids))
+        XCTAssertEqual(state, before)
+    }
+
     // MARK: import by value
 
     func testImportIsByValueSoSourceEditsAndDeletionDoNotMatter() throws {

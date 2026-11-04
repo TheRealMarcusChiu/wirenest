@@ -19,23 +19,48 @@ final class AppController: ObservableObject {
     private static let dnsRefreshTicks = 12
 
     @Published private(set) var state = AppState()
-    @Published private(set) var views: [UUID: TunnelView] = [:]
-    @Published private(set) var helperState = HelperState.checking
+    @Published private(set) var views: [UUID: TunnelView] = [:] {
+        didSet { logTunnelErrors() }
+    }
+    @Published private(set) var helperState = HelperState.checking {
+        didSet {
+            if case .needsInstall(let reason) = helperState {
+                report(reason, source: "helper", context: "Helper")
+            } else {
+                report(nil, source: "helper", context: "Helper")
+            }
+        }
+    }
     @Published private(set) var ssid = SSIDObservation.unavailable("Checking")
     @Published private(set) var publicIP: String?
     @Published private(set) var loginStatus = SMAppService.mainApp.status
     /// The latest refused or failed user action.
-    @Published var notice: String?
+    @Published var notice: String? {
+        didSet { report(notice, source: "notice", context: "WireNest") }
+    }
     /// Why the active connection cannot run as saved, e.g. a conflict.
-    @Published private(set) var connectionError: String?
-    @Published private(set) var dnsError: String?
+    @Published private(set) var connectionError: String? {
+        didSet { report(connectionError, source: "connection", context: "Connection") }
+    }
+    @Published private(set) var dnsError: String? {
+        didSet { report(dnsError, source: "dns", context: "DNS") }
+    }
     /// Why a matching rule cannot use its connection right now.
-    @Published private(set) var ruleProblem: String?
+    @Published private(set) var ruleProblem: String? {
+        didSet { report(ruleProblem, source: "rule", context: "Automation") }
+    }
     /// Why the helper stopped a default-route tunnel: another tunnel's endpoint lost its protecting route.
-    @Published private(set) var routeFailure: String?
+    @Published private(set) var routeFailure: String? {
+        didSet { report(routeFailure, source: "route", context: "Route safety") }
+    }
     @Published private(set) var isBusy = false
+    /// This session's failures. Fed only by the properties above, so it shows what really happened.
+    @Published private(set) var log = ActivityLog()
+    @Published var preferencesPane = PreferencesPane.connections
 
     var showPreferences: () -> Void = {}
+
+    private var tunnelsWithLoggedErrors: Set<UUID> = []
 
     private var store: StateStore?
     private let helper = HelperClient()
@@ -103,6 +128,50 @@ final class AppController: ObservableObject {
         } catch {
             notice = "Could not save settings: \(error.localizedDescription)"
         }
+    }
+
+    // MARK: Logs
+
+    private func report(_ message: String?, source: String, context: String) {
+        log.report(message, source: source, context: context, now: Date())
+    }
+
+    private func logTunnelErrors() {
+        let failing = Set(views.filter { $0.value.lastError != nil }.keys)
+        for id in tunnelsWithLoggedErrors.union(failing) {
+            let name = state.tunnel(id)?.name ?? "removed tunnel"
+            report(views[id]?.lastError, source: "tunnel.\(id)", context: "Tunnel \(name)")
+        }
+        tunnelsWithLoggedErrors = failing
+    }
+
+    func clearLogs() {
+        log.clear()
+    }
+
+    func copyLogs() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(log.text(), forType: .string)
+    }
+
+    func showLogs() {
+        preferencesPane = .logs
+        showPreferences()
+    }
+
+    /// Everything currently wrong, most specific first.
+    private var activeProblems: [String] {
+        var problems = [connectionError, routeFailure, dnsError, ruleProblem, notice].compactMap { $0 }
+        problems += views.values.compactMap(\.lastError)
+        if case .needsInstall(let reason) = helperState { problems.append(reason) }
+        return problems
+    }
+
+    /// A few words for the menu. The whole story is in the Logs pane.
+    var problemSummary: String? {
+        guard let first = activeProblems.first else { return nil }
+        let others = Set(activeProblems).count - 1
+        return others > 0 ? "\(shortFailure(first)) (+\(others) more)" : shortFailure(first)
     }
 
     // MARK: Loop
@@ -447,6 +516,11 @@ final class AppController: ObservableObject {
         kick()
     }
 
+    /// Only order changes, so nothing restarts.
+    func reorderTunnels(in profileID: UUID, _ order: [UUID]) {
+        mutate { try $0.reorderTunnels(in: profileID, order) }
+    }
+
     /// Throws so the editor can keep the user's text open with the reason. Only the edited tunnel restarts.
     func saveTunnel(_ id: UUID, name: String, configText: String) throws {
         var copy = state
@@ -457,6 +531,11 @@ final class AppController: ObservableObject {
     }
 
     // MARK: Rules
+
+    /// Takes effect at the next evaluation. It never disconnects what is already running.
+    func setRulesEnabled(_ enabled: Bool) {
+        mutate { $0.rulesEnabled = enabled }
+    }
 
     func addRule(_ condition: RuleCondition, profileID: UUID) {
         mutate { $0.rules.append(NetworkRule(condition: condition, profileID: profileID)) }

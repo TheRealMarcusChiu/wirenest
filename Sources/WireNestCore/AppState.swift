@@ -129,6 +129,13 @@ public struct AppState: Codable, Equatable {
     public var pinnedContext: String?
     /// Evaluated in order: the first matching rule wins.
     public var rules: [NetworkRule] = []
+    /// Optional so older saved state still decodes: rules always ran then, so missing means on.
+    private var automaticRulesEnabled: Bool?
+    /// Whether rules may pick connections at all. Each rule keeps its own switch beneath this.
+    public var rulesEnabled: Bool {
+        get { automaticRulesEnabled ?? true }
+        set { automaticRulesEnabled = newValue }
+    }
     public var publicIPAutomationEnabled = false
     public var publicIPCheckURL = AppState.defaultPublicIPCheckURL
 
@@ -244,6 +251,16 @@ public struct AppState: Codable, Equatable {
             tunnelID: tunnel.id, conflicts: conflicts, seededDNS: seeded,
             ignoredDNS: config.dnsEntries.filter { !seeded.contains($0) }
         )
+    }
+
+    /// `order` must hold exactly this connection's tunnels, so a stale or foreign list can never lose or move one.
+    public mutating func reorderTunnels(in profileID: UUID, _ order: [UUID]) throws {
+        guard let index = profiles.firstIndex(where: { $0.id == profileID }) else { throw StateError("Connection no longer exists.") }
+        let tunnels = profiles[index].tunnels
+        guard order.count == tunnels.count, Set(order) == Set(tunnels.map(\.id)) else {
+            throw StateError("The tunnel list changed. Try moving it again.")
+        }
+        profiles[index].tunnels = order.compactMap { id in tunnels.first { $0.id == id } }
     }
 
     /// The copy starts disabled because it necessarily overlaps its source.

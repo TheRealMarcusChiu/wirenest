@@ -269,6 +269,80 @@ final class RuleEngineTests: XCTestCase {
         XCTAssertEqual(state.activeProfileID, home)
     }
 
+    // MARK: global switch
+
+    func testDisablingAutomationStopsEveryRuleFromSelecting() {
+        var state = makeState(ordered: [(.ssidEquals("Home"), home)])
+        state.rulesEnabled = false
+        var engine = RuleEngine()
+        XCTAssertNil(settled(&engine, &state, NetworkSnapshot(ssid: .known("Home")), at: t0))
+        XCTAssertNil(engine.targetProblem)
+    }
+
+    func testDisablingAutomationLeavesAManualConnectionRunning() throws {
+        var state = makeState(ordered: [(.ssidEquals("Home"), home)])
+        state.rulesEnabled = false
+        try state.connect(away, pinContext: nil, ssid: .known("Home"))
+        var engine = RuleEngine()
+        XCTAssertNil(settled(&engine, &state, NetworkSnapshot(ssid: .known("Home")), at: t0))
+        XCTAssertEqual(state.activeProfileID, away)
+        XCTAssertTrue(state.connectionOn)
+        XCTAssertFalse(state.manualOff)
+        XCTAssertEqual(try state.desiredTunnels(ssid: .known("Home")).count, 1)
+    }
+
+    func testDisablingAutomationLeavesManualOffAndPinUntouched() {
+        var state = makeState(ordered: [(.ssidEquals("Cafe"), away)])
+        state.rulesEnabled = false
+        state.manualOff = true
+        state.pinnedContext = NetworkSnapshot(ssid: .known("Home")).contextKey(includingPublicIP: false)
+        let before = state
+        var engine = RuleEngine()
+        XCTAssertNil(settled(&engine, &state, NetworkSnapshot(ssid: .known("Cafe")), at: t0))
+        XCTAssertEqual(state, before)
+    }
+
+    func testReenablingActsOnlyOnWhatIsTrueNow() {
+        var state = makeState(ordered: [(.ssidEquals("Home"), home)])
+        state.rulesEnabled = false
+        var engine = RuleEngine()
+        _ = settled(&engine, &state, NetworkSnapshot(ssid: .known("Home")), at: t0)
+        state.rulesEnabled = true
+        let snapshot = NetworkSnapshot(ssid: .known("Home"))
+        XCTAssertNil(engine.evaluate(state: &state, snapshot: snapshot, now: t0.addingTimeInterval(100)), "the debounce starts over")
+        XCTAssertEqual(engine.evaluate(state: &state, snapshot: snapshot, now: t0.addingTimeInterval(100 + engine.debounce)), home)
+    }
+
+    func testAPublicIPChangeWhileDisabledIsNotQueuedForLater() {
+        var state = makeState(ordered: [(.publicIPChanges, away)])
+        state.publicIPAutomationEnabled = true
+        state.activeProfileID = home
+        state.connectionOn = true
+        var engine = RuleEngine()
+        let old = NetworkSnapshot(ssid: .known("Net"), publicIP: "203.0.113.1")
+        let new = NetworkSnapshot(ssid: .known("Net"), publicIP: "198.51.100.1")
+        _ = settled(&engine, &state, old, at: t0)
+
+        state.rulesEnabled = false
+        XCTAssertNil(settled(&engine, &state, new, at: t0.addingTimeInterval(100)))
+        state.rulesEnabled = true
+        XCTAssertNil(settled(&engine, &state, new, at: t0.addingTimeInterval(200)), "the address it now knows is the baseline")
+    }
+
+    func testIndividualRuleSwitchStillAppliesWhileAutomationIsOn() {
+        var state = makeState(ordered: [(.ssidEquals("Home"), home), (.ssidEquals("Home"), away)])
+        state.rules[0].enabled = false
+        var engine = RuleEngine()
+        XCTAssertEqual(settled(&engine, &state, NetworkSnapshot(ssid: .known("Home")), at: t0), away)
+    }
+
+    func testAutomationStaysOnByDefaultSoExistingRulesKeepWorking() {
+        var state = makeState(ordered: [(.ssidEquals("Home"), home)])
+        XCTAssertTrue(state.rulesEnabled)
+        var engine = RuleEngine()
+        XCTAssertEqual(settled(&engine, &state, NetworkSnapshot(ssid: .known("Home")), at: t0), home)
+    }
+
     // MARK: mandatory eligibility of rule targets
 
     func testIneligibleRuleTargetIsSkippedForTheNextEligibleRule() {
