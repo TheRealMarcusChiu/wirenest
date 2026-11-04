@@ -87,6 +87,10 @@ def canon_dest(dest):
 
 
 def parse_routes(text):
+    return [row[1:] for row in parse_route_fields(text)]
+
+
+def parse_route_fields(text):
     lines = text.splitlines()
     header = next((i for i, line in enumerate(lines) if line.split()[:2] == ["Destination", "Gateway"]), None)
     if header is None or not {"Flags", "Netif"} <= set(lines[header].split()):
@@ -101,7 +105,7 @@ def parse_routes(text):
         cidr = canon_dest(fields[0])
         if cidr is None or len(fields) <= max(flags, netif):
             raise ProofError(f"unreadable netstat row: {line.strip()}")
-        rows.append((cidr, fields[1], fields[flags], fields[netif]))
+        rows.append((fields[0], cidr, fields[1], fields[flags], fields[netif]))
     if not rows:
         raise ProofError("netstat output has no routes")
     return rows
@@ -205,6 +209,84 @@ def alias_problem(raw, alias):
     if not any(row[0] == alias + "/32" and row[3] == "lo0" for row in parse_routes(raw["routes"])):
         return f"{alias} has no exact local host route"
     return None
+
+
+ALIAS_TRACE_CAP = 16
+ALIAS_TRACE_FLAGS = set("UGHSWILCcRBb")
+
+
+def alias_route_class(raw_dest, gateway_text, flags, netif, gateway, interface):
+    """Fixed words only: a capture's gateway, interface or flag text never reaches the output."""
+    form = "mask32" if "/" in raw_dest else "host"
+    scope = "scoped" if "%" in raw_dest or "I" in flags else "unscoped"
+    if_class = "loopback" if netif == "lo0" else "physical" if netif == interface else "other"
+    if gateway_text == gateway:
+        gw_class = "physical"
+    else:
+        try:
+            gw_class = "loopback" if ipaddress.IPv4Address(gateway_text).is_loopback else "other"
+        except ValueError:
+            gw_class = "noaddress"  # link#N or a hardware address.
+    return f"{form},{scope},if:{if_class},gw:{gw_class},flags:{''.join(sorted(set(flags) & ALIAS_TRACE_FLAGS))}"
+
+
+def alias_presence(ifaces_text, alias):
+    try:
+        interfaces = parse_interfaces(ifaces_text)
+    except ProofError:
+        return "unreadable"
+    if (alias, "0xffffffff") in interfaces["lo0"]:
+        return "lo0-/32"
+    if any(addr == alias for addr, _ in interfaces["lo0"]):
+        return "lo0-other-mask"
+    if any(addr == alias for addresses in interfaces.values() for addr, _ in addresses):
+        return "other-interface"
+    return "absent"
+
+
+class AliasTrace:
+    """Transitions of each fixture alias's exact route, from captures the proof already makes. Printed only on failure."""
+
+    def __init__(self, gateway, interface, clock=time.monotonic):
+        self.gateway, self.interface, self.clock = gateway, interface, clock
+        self.index, self.start = 0, None
+        self.aliases = {tunnel["alias"]: {"records": [], "overflow": 0, "routes": None, "presence": None} for tunnel in (A, B)}
+
+    def observe(self, phase, routes_text, ifaces_text=None):
+        now = self.clock()
+        self.start = now if self.start is None else self.start
+        self.index += 1
+        try:
+            rows = parse_route_fields(routes_text)
+        except ProofError:
+            rows = None
+        for alias, trace in self.aliases.items():
+            if rows is None:
+                routes = "unreadable"
+            else:
+                exact = [alias_route_class(raw, gw, flags, netif, self.gateway, self.interface)
+                         for raw, cidr, gw, flags, netif in rows if cidr == alias + "/32"]
+                routes = ";".join(sorted(exact)) or "absent"
+            presence = None if ifaces_text is None else alias_presence(ifaces_text, alias)
+            if routes == trace["routes"] and presence in (None, trace["presence"]):
+                continue
+            trace["routes"] = routes
+            trace["presence"] = presence or trace["presence"]
+            record = f"#{self.index} +{int((now - self.start) * 1000)}ms {phase} presence={presence or 'not-sampled'} routes={routes}"
+            if len(trace["records"]) < ALIAS_TRACE_CAP:
+                trace["records"].append(record)
+            else:
+                trace["records"][-1] = record
+                trace["overflow"] += 1
+
+    def report(self, stream=None):
+        stream = stream or sys.stderr
+        for alias, trace in self.aliases.items():
+            for record in trace["records"] or ["no observations"]:
+                print(f"alias-route {alias} {record}", file=stream)
+            if trace["overflow"]:
+                print(f"alias-route {alias} overflow={trace['overflow']} transitions dropped", file=stream)
+        stream.flush()
 
 
 class Evidence:
@@ -708,12 +790,14 @@ def wait_full_routes_gone(reader=None, deadline=FULL_ROUTES_GONE_DEADLINE, sleep
         sleep(0.2)
 
 
-def wait_restored(baseline, deadline=20):
+def wait_restored(baseline, deadline=20, observer=lambda _raw: None):
     end = time.monotonic() + deadline
     current = None
     while True:
         try:
-            current = snapshot_text(capture())
+            raw = capture()
+            observer(raw)
+            current = snapshot_text(raw)
             if current == baseline:
                 return None
         except ProofError as error:
@@ -767,11 +851,17 @@ def helper_removed(state=job_state):
 
 # --- The proof.
 
-def sample(evidence, wg):
+def sample(evidence, wg, trace):
     try:
-        evidence.add_routes(parse_routes(run_read([NETSTAT, "-rnf", "inet"], limit=3)))
+        routes = run_read([NETSTAT, "-rnf", "inet"], limit=3)
     except ProofError:
-        pass  # A sample that cannot be read proves nothing; failures() needs real sightings.
+        trace.observe("app", "")
+    else:
+        trace.observe("app", routes)
+        try:
+            evidence.add_routes(parse_routes(routes))
+        except ProofError:
+            pass  # A sample that cannot be read proves nothing; failures() needs real sightings.
     rc, text = root(3, wg, "show", "all", "endpoints")
     if rc == 0:
         evidence.add_endpoints(text)
@@ -782,6 +872,8 @@ def run_case(order, ctx, fail):
     os.mkdir(case_dir)
     leased, peers, keys, logs = [], [], [], []
     watchdog = None
+    trace = AliasTrace(ctx["gateway"], ctx["interface"])
+    interrupted = False
     try:
         for tunnel in (A, B):
             leased.append(tunnel["alias"])
@@ -789,6 +881,7 @@ def run_case(order, ctx, fail):
             if rc != 0:
                 raise ProofError(f"could not lease {tunnel['alias']}: {text.strip()}")
         raw = capture()
+        trace.observe("before-startup", raw["routes"], raw["ifaces"])
         for tunnel in (A, B):
             problem = alias_problem(raw, tunnel["alias"])
             if problem:
@@ -816,7 +909,7 @@ def run_case(order, ctx, fail):
         out, err = os.path.join(case_dir, "app.out"), os.path.join(case_dir, "app.err")
         env = dict(os.environ, WIRENEST_FULL_ROUTE_SMOKE="1")
         status = run_app([ctx["driver"], "--helper-full-route-smoke", manifest], env, out, err,
-                         APP_DEADLINE - (time.monotonic() - armed_at), lambda: sample(evidence, ctx["installed_wg"]))
+                         APP_DEADLINE - (time.monotonic() - armed_at), lambda: sample(evidence, ctx["installed_wg"], trace))
         show_public([out, err], keys)
         verdict = app_verdict(status, read(out), order)
         if verdict:
@@ -826,6 +919,9 @@ def run_case(order, ctx, fail):
         print(f"ok: {order}: app marker, plus {evidence.samples} route samples showing /1 on {sorted(evidence.full_interfaces)} and /24 on {sorted(evidence.split_interfaces)}")
     except (ProofError, OSError, subprocess.SubprocessError) as error:
         fail(f"{order}: {error}")
+    except SystemExit:
+        interrupted = True
+        raise
     finally:
         # Every step runs whatever happened before it, and only ever adds failures.
         def step(action):
@@ -834,8 +930,13 @@ def run_case(order, ctx, fail):
             except (ProofError, OSError, subprocess.SubprocessError, ValueError) as error:
                 fail(f"{order}: cleanup: {error}")
 
+        def routes_after_app():
+            routes = run_read([NETSTAT, "-rnf", "inet"])
+            trace.observe("after-app", routes)
+            return routes
+
         def stop_watchdog():
-            if not wait_full_routes_gone():
+            if not wait_full_routes_gone(reader=routes_after_app):
                 fail(f"{order}: full routes were still present after {FULL_ROUTES_GONE_DEADLINE}s")
             for problem in disarm_watchdog(watchdog):
                 fail(f"{order}: {problem}")
@@ -856,11 +957,19 @@ def run_case(order, ctx, fail):
                     fail(f"{order}: could not remove {alias}: {text.strip()}")
 
         def compare_baseline():
-            leftover = wait_restored(ctx["baseline"])
+            leftover = wait_restored(ctx["baseline"], observer=lambda raw: trace.observe("after-cleanup", raw["routes"], raw["ifaces"]))
             if leftover is not None:
                 fail(f"{order}: the network did not return to its baseline:\n{leftover}")
             else:
                 print(f"ok: {order}: network state identical to the baseline")
+
+        def report_alias_routes():
+            # Last, so it covers cleanup, and it can neither fail the run nor stop what is above it.
+            try:
+                if ctx["failures"] or interrupted:
+                    trace.report()
+            except Exception as error:
+                print(f"alias-route report unavailable: {type(error).__name__}", file=sys.stderr)
 
         if watchdog:
             step(stop_watchdog)
@@ -868,6 +977,7 @@ def run_case(order, ctx, fail):
         step(lambda: show_public(logs if ctx["failures"] else [], keys))
         step(remove_aliases)
         step(compare_baseline)
+        report_alias_routes()
 
 
 def main(app, peer):
@@ -1484,7 +1594,216 @@ def self_test_fixtures():
             assert stat.S_IMODE(os.stat(spec["keys"]).st_mode) == 0o600
 
 
+def self_test_alias_trace():
+    alias_row = "127.77.0.2 127.77.0.2 UH lo0\n"
+    physical_row = "127.77.0.2 192.168.64.1 UGHS en0\n"
+    other = "127.77.0.3 127.77.0.3 UH lo0\n"
+    leased = FIXTURE_IFACES.replace("\tinet 127.0.0.1 netmask 0xff000000",
+                                    "\tinet 127.0.0.1 netmask 0xff000000\n\tinet 127.77.0.2 netmask 0xffffffff\n\tinet 127.77.0.3 netmask 0xffffffff")
+    ticks = iter(range(0, 100000, 250))
+
+    def new_trace():
+        return AliasTrace("192.168.64.1", "en0", clock=lambda: next(ticks) / 1000)
+
+    def report(trace):
+        with tempfile.TemporaryFile("w+") as stream:
+            trace.report(stream)
+            stream.seek(0)
+            return stream.read()
+
+    def lines_for(text, alias):
+        return [line for line in text.splitlines() if line.startswith(f"alias-route {alias} ")]
+
+    # The sequence the pinned wg-quick should produce: intact, then a physical host route, then restored.
+    trace = new_trace()
+    trace.observe("before-startup", FIXTURE_ROUTES + alias_row + other, leased)
+    trace.observe("app", FIXTURE_ROUTES + alias_row + other)  # No change, so no record.
+    trace.observe("app", FIXTURE_ROUTES + physical_row + other)
+    trace.observe("after-app", FIXTURE_ROUTES + other)
+    trace.observe("after-cleanup", FIXTURE_ROUTES + alias_row + other, leased)
+    text = report(trace)
+    a, b = lines_for(text, "127.77.0.2"), lines_for(text, "127.77.0.3")
+    assert len(a) == 4 and len(b) == 1, text
+    assert "#1 +0ms before-startup presence=lo0-/32 routes=host,unscoped,if:loopback,gw:loopback,flags:HU" in a[0], a[0]
+    assert "#3 " in a[1] and " app presence=not-sampled routes=host,unscoped,if:physical,gw:physical,flags:GHSU" in a[1], a[1]
+    assert "after-app presence=not-sampled routes=absent" in a[2], a[2]
+    assert "after-cleanup presence=lo0-/32 routes=host,unscoped,if:loopback" in a[3], a[3]
+    assert "192.168.64.1" not in text and "en0" not in text
+
+    # Host and /32 are different native rows, and scoped is not unscoped, even at one destination.
+    for row, expected in (
+        ("127.77.0.2/32 link#7 UCS en0 !\n", "mask32,unscoped,if:physical,gw:noaddress,flags:CSU"),
+        ("127.77.0.2 192.168.64.1 UGHSI en0\n", "host,scoped,if:physical,gw:physical,flags:GHISU"),
+        ("127.77.0.2%en0 192.168.64.1 UGHS en0\n", "host,scoped,if:physical,gw:physical,flags:GHSU"),
+        ("127.77.0.2 198.18.71.1 UGHS utun5\n", "host,unscoped,if:other,gw:other,flags:GHSU"),
+    ):
+        trace = new_trace()
+        trace.observe("app", FIXTURE_ROUTES + row)
+        assert expected in report(trace), (row, report(trace))
+    both = new_trace()
+    both.observe("app", FIXTURE_ROUTES + "127.77.0.2 192.168.64.1 UGHS en0\n127.77.0.2 127.77.0.2 UHI lo0\n")
+    assert report(both).count("host,") == 2
+
+    # Rows covering an alias are not that alias, so a parent never reads as its route.
+    parents = new_trace()
+    parents.observe("app", FIXTURE_ROUTES + "127.77/16 192.168.64.1 UGS en0\n")
+    assert "routes=absent" in report(parents)
+
+    # Presence is only reported from a real listing, and each kind is distinct.
+    for ifaces, expected in (
+        (FIXTURE_IFACES, "presence=absent"),
+        (leased, "presence=lo0-/32"),
+        (leased.replace("127.77.0.2 netmask 0xffffffff", "127.77.0.2 netmask 0xff000000"), "presence=lo0-other-mask"),
+        (FIXTURE_IFACES.replace("mtu 1380", "mtu 1380\n\tinet 127.77.0.2 netmask 0xffffffff"), "presence=other-interface"),
+        ("", "presence=unreadable"),
+    ):
+        trace = new_trace()
+        trace.observe("before-startup", FIXTURE_ROUTES, ifaces)
+        assert expected in lines_for(report(trace), "127.77.0.2")[0], (expected, report(trace))
+
+    # A presence change alone is a transition, and a later unsampled state does not erase it.
+    trace = new_trace()
+    trace.observe("before-startup", FIXTURE_ROUTES + alias_row, leased)
+    trace.observe("app", FIXTURE_ROUTES + alias_row)
+    trace.observe("after-cleanup", FIXTURE_ROUTES + alias_row, FIXTURE_IFACES)
+    assert len(lines_for(report(trace), "127.77.0.2")) == 2
+
+    # Privacy: nothing but whitelisted words, whatever the captures contain.
+    secrets_in_capture = ("203.0.113.77", "evil-host", "SECRETKEY", "tokenvalue", "aa:bb:cc:dd:ee:ff", "utun9", "<script>")
+    hostile = FIXTURE_ROUTES + "127.77.0.2 203.0.113.77 UGHS utun9\n127.77.0.2 evil-host U<script>G SECRETKEY\n127.77.0.2 aa:bb:cc:dd:ee:ff UHL tokenvalue\n"
+    trace = new_trace()
+    trace.observe("app", hostile)
+    trace.observe("app", "garbage SECRETKEY tokenvalue 203.0.113.77\n")
+    trace.observe("app", "")
+    text = report(trace)
+    assert not any(value in text for value in secrets_in_capture), text
+    assert "host,unscoped,if:other,gw:other,flags:GHSU" in text and "gw:noaddress" in text and "routes=unreadable" in text, text
+    assert all(re.fullmatch(r"alias-route 127\.77\.0\.[23] (no observations|#\d+ \+\d+ms [a-z-]+ presence=[a-z0-9/-]+ routes=[A-Za-z0-9:,;-]+|overflow=\d+ transitions dropped)", line)
+               for line in text.splitlines()), text
+
+    # Bounded: the first and the latest survive, and the loss is declared.
+    trace = new_trace()
+    for index in range(ALIAS_TRACE_CAP * 3):
+        trace.observe("app", FIXTURE_ROUTES + (alias_row if index % 2 else physical_row) + other)
+    text = report(trace)
+    a = lines_for(text, "127.77.0.2")
+    transitions = [line for line in a if "overflow" not in line]
+    assert len(transitions) == ALIAS_TRACE_CAP and "#1 " in transitions[0] and f"#{ALIAS_TRACE_CAP * 3} " in transitions[-1], text
+    assert f"overflow={ALIAS_TRACE_CAP * 3 - ALIAS_TRACE_CAP} transitions dropped" in a[-1], a[-1]
+    assert len(lines_for(text, "127.77.0.3")) == 1
+
+    assert "no observations" in report(new_trace())
+    assert parse_routes(FIXTURE_ROUTES)[0] == ("0.0.0.0/0", "192.168.64.1", "UGScg", "en0"), "the proof's own rows must not change shape"
+
+
+def self_test_case_reporting():
+    # run_case itself, with every native operation replaced: where the trace prints, and that it changes nothing else.
+    routes = (FIXTURE_ROUTES + "127.77.0.2 127.77.0.2 UH lo0\n127.77.0.3 127.77.0.3 UH lo0\n")
+    during = (FIXTURE_ROUTES + "127.77.0.2 192.168.64.1 UGHS en0\n127.77.0.3 127.77.0.3 UH lo0\n"
+              "0/1 link#9 USc utun5\n128.0/1 link#9 USc utun5\n198.18.72/24 link#10 USc utun6\n")
+    ifaces = FIXTURE_IFACES.replace("\tinet 127.0.0.1 netmask 0xff000000",
+                                    "\tinet 127.0.0.1 netmask 0xff000000\n\tinet 127.77.0.2 netmask 0xffffffff\n\tinet 127.77.0.3 netmask 0xffffffff")
+
+    class FakePeer:
+        pid = 1
+
+        def poll(self):
+            return None
+
+    def run(name, app_status, app_output, raises=None):
+        steps = []
+
+        def fake_run_app(_cmd, _env, out, err, _deadline, tick):
+            steps.append("app")
+            tick()
+            with open(out, "wb") as f:
+                f.write(app_output)
+            open(err, "wb").close()
+            if raises:
+                raise raises
+            return app_status
+
+        def fake_root(_limit, *argv):
+            if argv[0] == IFCONFIG:
+                steps.append("alias " + argv[3])
+            return 0, "utun5\tKEY=\t127.77.0.2:1\nutun6\tKEY=\t127.77.0.3:2\n"
+
+        def fake_wait_gone(reader=None, **_kwargs):
+            steps.append("gone")
+            reader()
+            return True
+
+        def fake_restored(_baseline, observer=None, **_kwargs):
+            steps.append("restored")
+            observer(dict(FIXTURE_RAW, routes=FIXTURE_ROUTES, ifaces=FIXTURE_IFACES))
+            return None
+
+        def fake_stop(_process):
+            steps.append("stop-peer")
+            return True
+
+        def fake_disarm(_watchdog):
+            steps.append("disarm")
+            return []
+
+        fakes = {
+            "root": fake_root, "capture": lambda: dict(FIXTURE_RAW, routes=routes, ifaces=ifaces),
+            "check_bind_source": lambda *_a, **_k: None, "wait_udp_bound": lambda *_a, **_k: None,
+            "fixtures": lambda *_a, **_k: ("/m", {"a": {"udp_port": 1, "http_port": 2, "token": "t", "keys": os.devnull},
+                                                  "b": {"udp_port": 3, "http_port": 4, "token": "t", "keys": os.devnull}}, [b"PRIVATEKEY"]),
+            "arm_watchdog": lambda *_a, **_k: time.monotonic(), "run_app": fake_run_app, "run_read": lambda *_a, **_k: during,
+            "wait_full_routes_gone": fake_wait_gone, "wait_restored": fake_restored, "stop_peer": fake_stop, "disarm_watchdog": fake_disarm,
+        }
+        saved = {key: globals()[key] for key in fakes}
+        real_popen, real_stdout, real_stderr = subprocess.Popen, sys.stdout, sys.stderr
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryFile("w+") as out_stream, tempfile.TemporaryFile("w+") as err_stream:
+            failures = []
+            ctx = {"tmp": tmp, "peer": "p", "driver": "d", "wg": "w", "installed_wg": "i", "failures": failures, "keep_tmp": False,
+                   "gateway": "192.168.64.1", "interface": "en0", "baseline": "b", "baseline_utuns": ["utun0"]}
+            globals().update(fakes)
+            subprocess.Popen = lambda *_a, **_k: FakePeer()
+            sys.stdout, sys.stderr = out_stream, err_stream
+            try:
+                try:
+                    run_case("split-first", ctx, failures.append)
+                    interrupted = False
+                except SystemExit:
+                    interrupted = True
+            finally:
+                globals().update(saved)
+                subprocess.Popen, sys.stdout, sys.stderr = real_popen, real_stdout, real_stderr
+            err_stream.seek(0)
+            return {"steps": steps, "failures": failures, "stderr": err_stream.read(), "interrupted": interrupted}
+
+    # The app fails, so app_verdict raises before evidence.failures() is reached.
+    failed = run("failed", 1, b"First tunnel carries traffic.\n")
+    assert failed["failures"] == ["split-first: the app exited 1"], failed["failures"]
+    assert "alias-route 127.77.0.2 #1 " in failed["stderr"] and "before-startup presence=lo0-/32" in failed["stderr"], failed["stderr"]
+    assert "app presence=not-sampled routes=host,unscoped,if:physical,gw:physical" in failed["stderr"], failed["stderr"]
+    assert "after-cleanup presence=absent routes=absent" in failed["stderr"], failed["stderr"]
+    assert "192.168.64.1" not in failed["stderr"]
+
+    # Cleanup and its order are exactly what they were, and a failure stays one failure.
+    expected = ["alias 127.77.0.2", "alias 127.77.0.3", "app", "gone", "disarm", "stop-peer", "stop-peer", "alias 127.77.0.2", "alias 127.77.0.3", "restored"]
+    assert failed["steps"] == expected, failed["steps"]
+
+    # A correct final line with a nonzero exit still fails, and still reports.
+    marked = run("marked", 1, b"FULL_ROUTE_SMOKE_PASSED split-first\n")
+    assert marked["failures"] and "alias-route" in marked["stderr"]
+
+    # Nothing on success, and the same steps ran.
+    passed = run("passed", 0, b"FULL_ROUTE_SMOKE_PASSED split-first\n")
+    assert passed["failures"] == [] and "alias-route" not in passed["stderr"], (passed["failures"], passed["stderr"])
+    assert passed["steps"] == expected, passed["steps"]
+
+    # A signal during the window: no failure recorded yet, but it is one, so the trace still prints.
+    stopped = run("stopped", 0, b"", raises=SystemExit(143))
+    assert stopped["interrupted"] and "alias-route" in stopped["stderr"] and stopped["steps"][-1] == "restored", stopped
+
+
 def self_test():
+    self_test_alias_trace()
+    self_test_case_reporting()
     self_test_parsers()
     self_test_evidence()
     self_test_watchdog()
