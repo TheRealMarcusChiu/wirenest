@@ -77,6 +77,10 @@ final class AppController: ObservableObject {
     private var lastProbe = Date.distantPast
     private var isProbing = false
 
+    init(initialState: AppState = AppState()) {
+        self.state = initialState
+    }
+
     func start() {
         loadState()
         observer.onNetworkEvent = { [weak self] in self?.networkEvent() }
