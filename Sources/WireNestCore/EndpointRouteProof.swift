@@ -108,8 +108,9 @@ public struct PhysicalGateway: Codable, Equatable {
 }
 
 /// What the kernel's table holds for one endpoint, judged against one gateway. `unknown` is never `absent`.
+/// `foreign` means no matching row at all. `mixed` means a matching row is there with another, or twice, so neither may be touched.
 public enum EndpointRowState: Equatable {
-    case unknown, absent, exact, cloneOnly, foreign
+    case unknown, absent, exact, cloneOnly, foreign, mixed
 }
 
 extension EndpointRouteProof {
@@ -174,7 +175,8 @@ extension EndpointRouteProof {
         }
         let exactCount = matching.filter(isExact).count
         let others = matching.filter { !isExact($0) && !$0.flags.contains("W") }
-        guard others.isEmpty, exactCount <= 1 else { return .foreign }
+        if !others.isEmpty { return exactCount == 0 ? .foreign : .mixed }
+        if exactCount > 1 { return .mixed }
         return exactCount == 1 ? .exact : .cloneOnly
     }
 

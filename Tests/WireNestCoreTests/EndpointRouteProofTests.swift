@@ -629,7 +629,13 @@ final class PhysicalGatewayParsingTests: XCTestCase {
                         "203.0.113.50 192.168.86.1 UGS en0", "203.0.113.50%en0 192.168.86.1 UGHS en0"] {
             XCTAssertEqual(row(foreign + "\n"), .foreign, foreign)
         }
-        XCTAssertEqual(row("203.0.113.50 192.168.86.1 UGHS en0\n203.0.113.50 192.168.86.9 UGHS en0\n"), .foreign, "an exact row beside another is not ours alone")
+        for mixed in ["203.0.113.50 192.168.86.1 UGHS en0\n203.0.113.50 192.168.86.9 UGHS en0\n",
+                      "203.0.113.50 192.168.86.1 UGHS en0\n203.0.113.50 192.168.86.1 UGHSI en1\n",
+                      "203.0.113.50 192.168.86.1 UGHS en0\n203.0.113.50%en1 192.168.90.1 UGHS en1\n",
+                      "203.0.113.50 192.168.86.1 UGHS en0\n203.0.113.50 192.168.86.1 UGHS en0\n"] {
+            XCTAssertEqual(row(mixed), .mixed, mixed)
+        }
+        XCTAssertEqual(row("203.0.113.50 192.168.86.1 UGHS en0\n203.0.113.50 192.168.86.1 UGHWIig en0\n"), .exact, "a clone beside it changes nothing")
         XCTAssertEqual(row("", netstat: CommandResult(status: 1, output: table)), .unknown)
         XCTAssertEqual(row("", netstat: good("no table")), .unknown)
         XCTAssertEqual(row("", netstat: good(table + "broken\n")), .unknown)
@@ -671,6 +677,7 @@ final class PhysicalGatewayParsingTests: XCTestCase {
         XCTAssertTrue(proven(lookup: lookup(mask: "255.255.255.255")))
         XCTAssertFalse(proven(lookup: lookup(), extra: ""), "no row")
         XCTAssertFalse(proven(lookup: lookup(), extra: "203.0.113.50 192.168.86.9 UGHS en0\n"), "another row")
+        XCTAssertFalse(proven(lookup: lookup(), extra: "203.0.113.50 192.168.86.1 UGHS en0\n203.0.113.50 192.168.90.1 UGHSI en1\n"), "a good row and a good lookup, beside another row")
         XCTAssertFalse(proven(lookup: lookup(), status: 1))
         XCTAssertFalse(proven(lookup: "garbage"))
         XCTAssertFalse(proven(lookup: lookup(destination: "default")))
@@ -724,6 +731,7 @@ final class GatewayEndpointRootTests: XCTestCase {
     }
 
     private var status: HelperStatus { engine.handle(.status).status! }
+    private var routeProblem: String? { status.routeFailure }
     private func running(_ id: UUID) -> Bool { status.tunnels.contains { $0.tunnelID == id && $0.alive } }
     private var upCount: Int { commands.quickCalls.filter { $0[1] == "up" }.count }
     private var journalURL: URL { paths.runtimeDir.appendingPathComponent("session.json") }
@@ -845,23 +853,125 @@ final class GatewayEndpointRootTests: XCTestCase {
         }
     }
 
-    func testATimedOutAddIsUnprovenAndItsRowIsSettledByTheRollback() throws {
-        ok(.up(tunnelID: splitID, config: split))
-        commands.routeAddResult = CommandResult(status: 124, output: "Timed out")
-        var error = try XCTUnwrap(engine.handle(.up(tunnelID: fullID, config: full)).error)
-        XCTAssertFalse(error.contains("No protective route was added"), error)
-        XCTAssertTrue(deletes.isEmpty, "the table shows it never happened")
-        XCTAssertFalse(journal.contains(endpoint), "and that is affirmative, so nothing is left to track")
-        XCTAssertEqual(upCount, 1)
-
-        // Here it did happen before the deadline. The row was absent when intent was journaled, so it is ours.
-        commands.onRouteChange = { [unowned self] verb in
-            if verb == "add" { self.commands.hostRoutes[self.endpoint] = "\(self.endpoint)     192.168.86.1     UGHS     en0\n" }
+    func testATimedOutAddThatLeftNoRowLeavesNothingToTrack() throws {
+        for exitStatus: Int32 in [124, 137] {
+            ok(.up(tunnelID: splitID, config: split))
+            commands.routeAddResult = CommandResult(status: exitStatus, output: "Timed out")
+            let error = try XCTUnwrap(engine.handle(.up(tunnelID: fullID, config: full)).error)
+            XCTAssertFalse(error.contains("No protective route was added"), error)
+            XCTAssertTrue(deletes.isEmpty)
+            XCTAssertFalse(journal.contains(endpoint), "the table shows there is nothing, which is affirmative")
+            XCTAssertEqual(upCount, 1)
+            commands.routeAddResult = nil
+            ok(.downAll)
+            commands.calls.removeAll()
         }
-        error = try XCTUnwrap(engine.handle(.up(tunnelID: fullID, config: full)).error)
-        XCTAssertEqual(upCount, 1, "an unconfirmed add never lets the default start")
-        XCTAssertEqual(deletes, [["-q", "-n", "delete", "-inet", endpoint, "192.168.86.1"]])
+    }
+
+    /// Absence, then intent, then an identical row does not show the row is ours: another root writer could have put it there.
+    func testAnIdenticalRowAfterAnUnconfirmedAddIsNeverPromotedOrDeleted() throws {
+        for exitStatus: Int32 in [124, 137] {
+            ok(.up(tunnelID: splitID, config: split))
+            let identical = "\(endpoint)     192.168.86.1     UGHS     en0\n"
+            commands.routeAddResult = CommandResult(status: exitStatus, output: "Timed out")
+            commands.onRouteChange = { [unowned self] verb in
+                if verb == "add" { self.commands.hostRoutes[self.endpoint] = identical }
+            }
+            XCTAssertNotNil(engine.handle(.up(tunnelID: fullID, config: full)).error)
+            commands.onRouteChange = nil
+            commands.routeAddResult = nil
+
+            func assertUnresolved(_ context: String) {
+                XCTAssertTrue(deletes.isEmpty, context)
+                XCTAssertEqual(commands.hostRoutes[endpoint], identical, context)
+                XCTAssertTrue(journal.contains("adding") && !journal.contains("installed"), context)
+                XCTAssertEqual(upCount, 1, "\(context): the capturing tunnel never ran")
+            }
+            assertUnresolved("rollback")
+
+            XCTAssertNotNil(routeProblem, "visible on every poll")
+            assertUnresolved("polled")
+
+            XCTAssertNotNil(engine.handle(.up(tunnelID: fullID, config: full)).error, "a retry is refused too")
+            assertUnresolved("retried")
+
+            ok(.down(tunnelID: splitID))
+            XCTAssertNotNil(engine.handle(.downAll).error, "uninstall must not call this complete")
+            assertUnresolved("uninstall")
+
+            engine = try restarted()
+            XCTAssertNotNil(routeProblem)
+            assertUnresolved("restarted")
+
+            // By hand, or by whoever owned it. Absence is the only thing that settles it.
+            commands.hostRoutes[endpoint] = nil
+            XCTAssertNil(routeProblem, "resolved")
+            XCTAssertFalse(journal.contains(endpoint))
+            ok(.downAll)
+            commands.calls.removeAll()
+        }
+    }
+
+    func testAnUnconfirmedAddKeepsARunningPairsDefaultStopped() throws {
+        startPair()
+        // The same state, reached by a crash with the row still present and the full tunnel up.
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: journalURL)) as? [String: Any])
+        var routes = try XCTUnwrap(object["endpointRoutes"] as? [String: [String: String]])
+        routes[endpoint]?["phase"] = "adding"
+        object["endpointRoutes"] = routes
+        try JSONSerialization.data(withJSONObject: object).write(to: journalURL)
+
+        engine = try restarted()
+        XCTAssertNil(commands.slots["wn1"], "contained, even though the row looks exactly right")
+        XCTAssertNotNil(commands.slots["wn0"])
+        XCTAssertTrue(deletes.isEmpty)
+        XCTAssertNotNil(commands.hostRoutes[endpoint])
+        XCTAssertNotNil(routeProblem)
+    }
+
+    func testAConfirmedAddWhoseReadBackIsUnknownIsOursOnceItCanBeRead() {
+        ok(.up(tunnelID: splitID, config: split))
+        commands.onRouteChange = { [unowned self] verb in
+            if verb == "add" { self.commands.netstatResult = CommandResult(status: 124, output: "") }
+        }
+        XCTAssertNotNil(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        commands.onRouteChange = nil
+        XCTAssertEqual(upCount, 1, "unread is not proven")
+        XCTAssertTrue(journal.contains("installed"), "exit 0 is the receipt, recorded before any read-back")
+        XCTAssertTrue(deletes.isEmpty)
+
+        commands.netstatResult = nil
+        XCTAssertNil(routeProblem)
+        XCTAssertEqual(deletes.count, 1, "confirmed as ours, with nothing needing it now")
         XCTAssertNil(commands.hostRoutes[endpoint])
+    }
+
+    func testAReceiptThatCannotBeRecordedIsNotQuietlyUpgradedLater() throws {
+        try XCTSkipIf(geteuid() == 0, "root ignores directory permissions")
+        ok(.up(tunnelID: splitID, config: split))
+        let directory = paths.runtimeDir.path
+        func allowWrites(_ allowed: Bool) {
+            try? FileManager.default.setAttributes([.posixPermissions: allowed ? 0o700 : 0o500], ofItemAtPath: directory)
+        }
+        defer { allowWrites(true) }
+        commands.onRouteChange = { verb in
+            if verb == "add" { allowWrites(false) }
+        }
+        XCTAssertNotNil(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        commands.onRouteChange = nil
+        allowWrites(true)
+
+        for context in ["polled", "polled again"] {
+            XCTAssertNotNil(routeProblem, context)
+            XCTAssertTrue(journal.contains("adding") && !journal.contains("installed"), context)
+            XCTAssertTrue(deletes.isEmpty, context)
+        }
+        engine = try restarted()
+        XCTAssertNotNil(routeProblem)
+        XCTAssertTrue(journal.contains("adding") && !journal.contains("installed"))
+        XCTAssertTrue(deletes.isEmpty)
+        XCTAssertNotNil(commands.hostRoutes[endpoint], "even our own row, which nothing durable can show is ours")
+        XCTAssertEqual(upCount, 1)
     }
 
     func testATimedOutAddStaysTrackedWhileTheTableCannotBeRead() throws {
@@ -1208,17 +1318,111 @@ final class GatewayEndpointRootTests: XCTestCase {
         XCTAssertEqual(deletes.count, 1, "only the earlier real stop")
     }
 
-    func testCrashWhileAddingAfterTheRowExistsRemovesIt() throws {
+    func testCrashWhileAddingWithAMatchingRowKeepsItAsVisibleDebt() throws {
         ok(.up(tunnelID: splitID, config: split))
         let atAdd = try journalAtFirst("add") { ok(.up(tunnelID: fullID, config: full)) }
         commands.slots["wn1"] = nil
         try atAdd.write(to: journalURL)
         XCTAssertNotNil(commands.hostRoutes[endpoint])
 
-        _ = try restarted()
-        XCTAssertNil(commands.hostRoutes[endpoint], "no capturing tunnel, so no reason to keep it")
+        engine = try restarted()
+        XCTAssertNotNil(commands.hostRoutes[endpoint], "it might be someone else's")
+        XCTAssertTrue(deletes.isEmpty)
+        XCTAssertTrue(journal.contains("adding") && !journal.contains("installed"))
+        XCTAssertNotNil(routeProblem)
+        XCTAssertNotNil(commands.slots["wn0"], "the split is untouched")
+        XCTAssertNotNil(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        XCTAssertNil(commands.slots["wn1"], "and the capturing tunnel cannot start on it")
+
+        XCTAssertNotNil(engine.handle(.downAll).error, "uninstall must not call this complete")
+        XCTAssertTrue(journal.contains("adding"))
+        XCTAssertNotNil(commands.hostRoutes[endpoint])
+
+        commands.hostRoutes[endpoint] = nil
+        ok(.downAll)
         XCTAssertFalse(journal.contains(endpoint))
+    }
+
+    // MARK: our row beside another
+
+    private lazy var ownRow = "\(endpoint)     192.168.86.1     UGHS     en0\n"
+    private lazy var scopedForeignRow = "\(endpoint)     192.168.90.1     UGHSI     en1\n"
+
+    func testAMixedRowWhileRunningStopsTheDefaultAndKeepsOwnershipUntilItIsClear() {
+        startPair()
+        commands.hostRoutes[endpoint] = ownRow + scopedForeignRow
+        XCTAssertNotNil(routeProblem)
+        XCTAssertNil(commands.slots["wn1"], "our row and the lookup both look right, but the table is ambiguous")
         XCTAssertNotNil(commands.slots["wn0"])
+        XCTAssertTrue(deletes.isEmpty)
+        XCTAssertEqual(commands.hostRoutes[endpoint], ownRow + scopedForeignRow)
+        XCTAssertTrue(journal.contains("\"\(endpoint)\""), "our row is still there, so ownership did not end")
+
+        XCTAssertNotNil(routeProblem, "visible while it lasts")
+        XCTAssertTrue(deletes.isEmpty)
+
+        commands.hostRoutes[endpoint] = ownRow
+        XCTAssertNil(routeProblem)
+        XCTAssertEqual(deletes, [["-q", "-n", "delete", "-inet", endpoint, "192.168.86.1"]], "unambiguous again, and confirmed ours")
+        XCTAssertFalse(journal.contains(endpoint))
+    }
+
+    func testAMixedRowBlocksTeardownAndRecoveryUntilItIsClear() throws {
+        startPair()
+        commands.hostRoutes[endpoint] = ownRow + scopedForeignRow
+        XCTAssertNotNil(engine.handle(.downAll).error, "uninstall must not call this complete")
+        XCTAssertTrue(deletes.isEmpty)
+        XCTAssertTrue(journal.contains(endpoint))
+
+        engine = try restarted()
+        XCTAssertNotNil(routeProblem)
+        XCTAssertTrue(deletes.isEmpty)
+        XCTAssertTrue(journal.contains(endpoint))
+
+        commands.hostRoutes[endpoint] = ownRow
+        ok(.downAll)
+        XCTAssertEqual(deletes.count, 1)
+        XCTAssertNil(commands.hostRoutes[endpoint])
+        XCTAssertFalse(journal.contains(endpoint))
+    }
+
+    func testOnceOurRowIsGoneAForeignRowEndsOwnershipAndStays() {
+        startPair()
+        commands.hostRoutes[endpoint] = ownRow + scopedForeignRow
+        XCTAssertNotNil(routeProblem)
+
+        commands.hostRoutes[endpoint] = scopedForeignRow
+        XCTAssertNil(routeProblem)
+        XCTAssertEqual(commands.hostRoutes[endpoint], scopedForeignRow)
+        XCTAssertTrue(deletes.isEmpty)
+        XCTAssertFalse(journal.contains("\"\(endpoint)\""))
+    }
+
+    func testAMixedRowAfterAConfirmedAddIsKeptWithoutDeleting() {
+        ok(.up(tunnelID: splitID, config: split))
+        commands.routeAddInstalls = ownRow + scopedForeignRow
+        XCTAssertNotNil(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        XCTAssertEqual(upCount, 1)
+        XCTAssertTrue(deletes.isEmpty)
+        XCTAssertTrue(journal.contains("installed"))
+    }
+
+    func testAMixedRowThatWasNeverOursIsRefusedAndNotAdopted() {
+        ok(.up(tunnelID: splitID, config: split))
+        commands.hostRoutes[endpoint] = ownRow + scopedForeignRow
+        XCTAssertNotNil(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        XCTAssertEqual(upCount, 1)
+        XCTAssertTrue(commands.routeChanges.isEmpty)
+        XCTAssertFalse(journal.contains(endpoint))
+    }
+
+    func testATwoRowDuplicateIsMixedInTheLifecycleToo() {
+        startPair()
+        commands.hostRoutes[endpoint] = ownRow + ownRow
+        XCTAssertNotNil(routeProblem)
+        XCTAssertNil(commands.slots["wn1"])
+        XCTAssertTrue(deletes.isEmpty)
+        XCTAssertTrue(journal.contains(endpoint))
     }
 
     func testCrashWhileRemovingFinishesAndAnUnknownTableWaits() throws {

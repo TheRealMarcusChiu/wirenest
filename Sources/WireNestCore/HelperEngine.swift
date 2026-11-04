@@ -63,6 +63,8 @@ public final class HelperEngine {
     /// A host route this helper added, keeping another tunnel's endpoint out of a default-route tunnel. Journaled before
     /// `route` runs and removed only once the row is verified gone or affirmatively someone else's.
     private struct EndpointRoute: Codable {
+        /// `adding` is intent only: a matching row may be another writer's, so it is never promoted or deleted for matching.
+        /// Only an exit 0 from our own `route add`, recorded as `installed`, makes the route ours. `removing` follows from that.
         enum Phase: String, Codable { case adding, installed, removing }
         let gateway: String
         let interface: String
@@ -99,6 +101,7 @@ public final class HelperEngine {
     private static let noRouteAdded = "No protective route was added."
     private static let routeUnconfirmed = "A protective route command ran, but its effect could not be confirmed."
     private static let routeDebtMessage = "A protective route to a tunnel's endpoint could not be confirmed or removed. It stays tracked and will be retried."
+    private static let unconfirmedRouteMessage = "A route to a tunnel's endpoint may exist, but nothing shows WireNest created it, so it was not removed. A default-route tunnel cannot run beside the tunnel using that endpoint until the route is gone. Remove it by hand if nothing else needs it."
     private static let pollInterval: TimeInterval = 0.25
     private static let cleanupPolls = 80
     private static let retryCleanupPolls = 20
@@ -336,7 +339,7 @@ public final class HelperEngine {
         return hosts
     }
 
-    /// A row found exact counts only under the gateway the kernel uses now, and a timed out add stays unproven until a later reconcile settles it.
+    /// A row found exact counts only under the gateway the kernel uses now, and never while our own unconfirmed add is outstanding.
     private func gatewayRouteProven(_ endpoint: String, ownedInterfaces owned: Set<String>) -> Bool {
         guard session.endpointRoutes[endpoint]?.phase != .adding else { return false }
         let table = EndpointRouteProof.readRoutingTable(runner)
@@ -398,8 +401,14 @@ public final class HelperEngine {
         for (endpoint, route) in session.endpointRoutes.sorted(by: { $0.key < $1.key }) where !demand.keep.contains(endpoint) {
             if !removeEndpointRoute(endpoint, route) { settled = false }
         }
-        for endpoint in demand.addable.sorted() { ensureEndpointRoute(endpoint) }
-        endpointRouteDebt = settled ? nil : Self.routeDebtMessage
+        for endpoint in demand.addable.sorted() {
+            if !ensureEndpointRoute(endpoint) { settled = false }
+        }
+        if session.endpointRoutes.values.contains(where: { $0.phase == .adding }) {
+            endpointRouteDebt = Self.unconfirmedRouteMessage
+        } else {
+            endpointRouteDebt = settled ? nil : Self.routeDebtMessage
+        }
     }
 
     private func recordEndpointRoute(_ endpoint: String, _ route: EndpointRoute?) -> Bool {
@@ -414,7 +423,8 @@ public final class HelperEngine {
         }
     }
 
-    private func ensureEndpointRoute(_ endpoint: String) {
+    /// False if a journaled route is left unsettled, as opposed to a refusal that leaves nothing behind.
+    private func ensureEndpointRoute(_ endpoint: String) -> Bool {
         let problem: (String, String) -> Void = { reason, tail in self.endpointRouteProblems[endpoint] = (reason, tail) }
         let table = EndpointRouteProof.readRoutingTable(runner)
         let owned = ownedInterfaces()
@@ -422,29 +432,36 @@ public final class HelperEngine {
         if let tracked = session.endpointRoutes[endpoint] {
             switch EndpointRouteProof.endpointRow(endpoint, gateway: tracked.gateway, interface: tracked.interface, netstat: table) {
             case .exact:
+                if tracked.phase == .adding {
+                    problem("a matching route exists, but nothing shows this helper created it", Self.routeUnconfirmed)
+                    return false
+                }
                 // Left as it is even if the gateway has moved. The proof fails and stops the default first, and only then is it removed.
                 if tracked.phase != .installed {
                     var installed = tracked
                     installed.phase = .installed
                     _ = recordEndpointRoute(endpoint, installed)
                 }
-                return
+                return true
             case .unknown:
-                return
+                return false
+            case .mixed:
+                problem("another route to it exists beside the protective one", "Both routes were left in place.")
+                return false
             case .foreign:
                 // Someone else's row now, so ownership ends here and that row stays.
                 _ = recordEndpointRoute(endpoint, nil)
                 problem("another route to it replaced the protective one", "That route was left in place.")
-                return
+                return true
             case .absent, .cloneOnly:
-                guard recordEndpointRoute(endpoint, nil) else { return }
+                guard recordEndpointRoute(endpoint, nil) else { return false }
             }
         }
 
-        guard EndpointRouteProof.refusal(endpoint: endpoint, ownedInterfaces: owned, runner: runner) != nil else { return }
+        guard EndpointRouteProof.refusal(endpoint: endpoint, ownedInterfaces: owned, runner: runner) != nil else { return true }
         guard EndpointRouteProof.isProtectableEndpoint(endpoint) else {
             problem("only a numeric unicast IPv4 endpoint can get a protective route", Self.noRouteAdded)
-            return
+            return true
         }
         let ifconfig = runner.run("/sbin/ifconfig", ["-a"], timeout: 5, readyMarker: nil)
         guard let physical = EndpointRouteProof.physicalGateway(
@@ -453,69 +470,76 @@ public final class HelperEngine {
             ownedInterfaces: owned
         ) else {
             problem("the physical default gateway could not be proven", Self.noRouteAdded)
-            return
+            return true
         }
         guard !EndpointRouteProof.isOnLink(endpoint, ifconfig: ifconfig) else {
             problem("it is on a connected network, which a gateway route cannot protect", Self.noRouteAdded)
-            return
+            return true
         }
         guard !EndpointRouteProof.hasCoveringRoute(endpoint, netstat: table) else {
             problem("another route already covers it", Self.noRouteAdded)
-            return
+            return true
         }
         switch EndpointRouteProof.endpointRow(endpoint, gateway: physical.gateway, interface: physical.interface, netstat: table) {
         case .exact:
-            return  // Not ours: the proof may rely on it, and nothing here ever deletes it.
+            return true  // Not ours: the proof may rely on it, and nothing here ever deletes it.
         case .unknown:
             problem("the routing table could not be read", Self.noRouteAdded)
-            return
-        case .foreign:
+            return true
+        case .foreign, .mixed:
             problem("a different route to it already exists", Self.noRouteAdded)
-            return
+            return true
         case .absent, .cloneOnly:
             break
         }
 
         guard recordEndpointRoute(endpoint, EndpointRoute(gateway: physical.gateway, interface: physical.interface, phase: .adding)) else {
             problem("its intent could not be recorded", Self.noRouteAdded)
-            return
+            return true
         }
         let added = runner.run(Self.routeTool, ["-q", "-n", "add", "-inet", endpoint, "-gateway", physical.gateway], timeout: 5, readyMarker: nil)
         if added.status != 0 {
             if added.status == 124 || added.status >= 128 {
-                // It may or may not have happened, so this stays tracked like a crash in the same place.
+                // It may or may not have happened, and an identical row could be someone else's, so only absence can settle this.
                 problem("adding the route timed out", Self.routeUnconfirmed)
-            } else {
-                // A refused add leaves nothing of ours, and whatever made it fail is not ours to adopt or delete.
-                _ = recordEndpointRoute(endpoint, nil)
-                problem("the route could not be added", Self.noRouteAdded)
+                return false
             }
-            return
+            // A refused add leaves nothing of ours, and whatever made it fail is not ours to adopt or delete.
+            _ = recordEndpointRoute(endpoint, nil)
+            problem("the route could not be added", Self.noRouteAdded)
+            return true
+        }
+        // The receipt comes before any read-back. If it cannot be recorded this stays `adding`, and no later poll upgrades it.
+        guard recordEndpointRoute(endpoint, EndpointRoute(gateway: physical.gateway, interface: physical.interface, phase: .installed)) else {
+            problem("creating the route could not be recorded", Self.routeUnconfirmed)
+            return false
         }
         switch EndpointRouteProof.endpointRow(endpoint, gateway: physical.gateway, interface: physical.interface, netstat: EndpointRouteProof.readRoutingTable(runner)) {
         case .exact:
-            _ = recordEndpointRoute(endpoint, EndpointRoute(gateway: physical.gateway, interface: physical.interface, phase: .installed))
-        case .unknown:
-            problem("the added route could not be read back", Self.routeUnconfirmed)
+            return true
+        case .unknown, .mixed:
+            problem("the added route could not be read back unambiguously", Self.routeUnconfirmed)
+            return false
         case .absent, .cloneOnly, .foreign:
             _ = recordEndpointRoute(endpoint, nil)
             problem("the added route did not take effect", Self.routeUnconfirmed)
+            return true
         }
     }
 
-    /// True once nothing of ours remains. Deletes only a row that is exactly the one recorded, read immediately before.
+    /// True once nothing of ours remains. Deletes only a row we confirmed creating, exactly as recorded and read immediately before.
     private func removeEndpointRoute(_ endpoint: String, _ route: EndpointRoute) -> Bool {
         guard EndpointRouteProof.isProtectableEndpoint(endpoint), CIDR(route.gateway)?.isIPv6 == false, !route.gateway.contains("/") else { return false }
         func rowNow() -> EndpointRowState {
             EndpointRouteProof.endpointRow(endpoint, gateway: route.gateway, interface: route.interface, netstat: EndpointRouteProof.readRoutingTable(runner))
         }
         switch rowNow() {
-        case .unknown:
+        case .unknown, .mixed:
             return false
         case .absent, .cloneOnly, .foreign:
             return recordEndpointRoute(endpoint, nil)
         case .exact:
-            break
+            guard route.phase != .adding else { return false }
         }
         var removing = route
         removing.phase = .removing
@@ -523,7 +547,7 @@ public final class HelperEngine {
         // The verification below decides, not this exit status.
         _ = runner.run(Self.routeTool, ["-q", "-n", "delete", "-inet", endpoint, route.gateway], timeout: 5, readyMarker: nil)
         switch rowNow() {
-        case .unknown, .exact:
+        case .unknown, .exact, .mixed:
             return false
         case .absent, .cloneOnly, .foreign:
             return recordEndpointRoute(endpoint, nil)
