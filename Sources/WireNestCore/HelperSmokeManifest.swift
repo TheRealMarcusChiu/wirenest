@@ -84,7 +84,25 @@ public struct HelperSmokeManifest {
 
 /// True only for a complete HTTP 200 whose whole body is the token, so a stale or other peer's answer cannot pass.
 public func smokeResponseMatches(_ response: String, token: String) -> Bool {
-    guard let split = response.range(of: "\r\n\r\n") else { return false }
-    let status = response[..<split.lowerBound].components(separatedBy: "\r\n").first ?? ""
-    return status.split(separator: " ").dropFirst().first == "200" && response[split.upperBound...] == token
+    let check = SmokeResponseCheck(response: response, token: token)
+    return check.headerComplete && check.status200 && check.bodyMatches
+}
+
+struct SmokeResponseCheck {
+    let headerComplete: Bool
+    let status200: Bool
+    let bodyMatches: Bool
+
+    init(response: String, token: String) {
+        guard let split = response.range(of: "\r\n\r\n") else {
+            headerComplete = false
+            status200 = false
+            bodyMatches = false
+            return
+        }
+        headerComplete = true
+        let status = response[..<split.lowerBound].components(separatedBy: "\r\n").first ?? ""
+        status200 = status.split(separator: " ").dropFirst().first == "200"
+        bodyMatches = response[split.upperBound...] == token
+    }
 }

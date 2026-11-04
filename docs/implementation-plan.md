@@ -328,6 +328,7 @@ act on it. Other changes to saved state from a rule are committed only with a su
 | `SupervisorTests` | Backoff, per-peer health, per-tunnel restarts, no storms, adoption |
 | `HelperEngineTests` | Argv and file hygiene, boundary validation, DNS lifecycle, crash and boot recovery, install protocol |
 | `EndpointRouteProofTests` | Assessment of the full-plus-narrow pair, replay of observed Darwin output with labelled synthetic mutations, read-only real commands, root preflight, postflight, loss of proof and recovery |
+| `HelperSmokeDiagnosticsTests` | Failure-only proof diagnostics: bounded aggregation, same match result as the proof, and no response, token or key in any line |
 | `HelperFullRouteManifestTests` | The separate full-route manifest's exact values, CI opt-in, and the original manifest still refusing this shape |
 | `HelperLifecycleTests` | Teardown barrier, start verification, journal crash points, DNS retry and pending services, install staging race, smoke manifest |
 
@@ -349,6 +350,14 @@ and answer with moving counters, and A must not answer. After each `up`, both mu
 the helper must own nothing. It prints `HELPER_SMOKE_PASSED` and exits 0 only after all of that; anything
 else exits nonzero with a key-free message and takes down what it started. Overall time is bounded by the
 harness. `scripts/smoke-helper.sh` owns the fixtures, peers, install and uninstall.
+
+On a failed proof only, `--helper-smoke` prints `HELPER_SMOKE_DIAGNOSTIC:` lines to stderr before its cleanup:
+the phase, one aggregated line per probe (furthest connection stage, error category and code, byte count, and whether
+the header, status and body matched), then each tunnel's interface, alive state, handshake age and counters from a
+normal status call with a 5 second limit, and an ordinary route lookup of each reserved probe with a 2 second limit.
+No response, token, key or system error text is logged. Pass criteria and retries are unchanged. This exists because
+this proof failed intermittently at different points on both architectures (CI 41773978742 and 41774874577) with
+**no established cause**. These lines can narrow that down, but the failure stays open until a native run explains it.
 
 ## Full-route proof
 

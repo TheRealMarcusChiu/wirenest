@@ -28,9 +28,11 @@ enum HelperSmoke {
                 let manifest = try HelperSmokeManifest.load(path: path)
                 // Checked before the cleanup below can apply, which must never touch tunnels this run did not start.
                 try await requireIdleHelper(client)
+                let trace = ProofTrace()
                 do {
-                    try await prove(manifest, client: client)
+                    try await prove(manifest, client: client, trace: trace)
                 } catch {
+                    await emitDiagnostics(manifest, client: client, trace: trace)
                     _ = try? await client.send(.downAll)
                     throw error
                 }
@@ -57,7 +59,45 @@ enum HelperSmoke {
         }
     }
 
-    private static func prove(_ manifest: HelperSmokeManifest, client: HelperClient) async throws {
+    /// Read only by the failure path, once the proof has stopped. Written by the proof's one sequential task.
+    private final class ProofTrace {
+        var phase = "initial"
+        var probeLines: [String] = []
+    }
+
+    /// Failure-only, and unable to change the result: every step is bounded and none can throw. This runs before the
+    /// cleanup, because the state that failed is gone afterwards. It reports what happened and does not say why.
+    private static func emitDiagnostics(_ manifest: HelperSmokeManifest, client: HelperClient, trace: ProofTrace) async {
+        func emit(_ line: String) {
+            FileHandle.standardError.write(Data("HELPER_SMOKE_DIAGNOSTIC: \(redactSecrets(line))\n".utf8))
+        }
+        emit("phase=\(trace.phase)")
+        trace.probeLines.forEach(emit)
+
+        let tunnels = [("A", manifest.tunnels[0]), ("B", manifest.tunnels[1])]
+        var status: HelperStatus?
+        do {
+            status = try await client.send(.status, timeout: 5)
+        } catch is HelperClientError {
+            emit("status unavailable category=helperClient")
+        } catch {
+            emit("status unavailable category=other")
+        }
+        if let status {
+            for (label, tunnel) in tunnels {
+                emit(formatTunnelStatusDiagnostic(tunnel: label, status: status.tunnels.first { $0.tunnelID == tunnel.id }, now: Date()))
+            }
+        }
+
+        let commands = ReadOnlyCommands(maxTimeout: 2)
+        for (label, tunnel) in tunnels {
+            let expected = status?.tunnels.first { $0.tunnelID == tunnel.id }?.interface
+            let lookup = EndpointRouteProof.lookupInterface(tunnel.probeHost, runner: commands)
+            emit(formatRouteDiagnostic(tunnel: label, probeHost: tunnel.probeHost, lookup: lookup, expected: expected))
+        }
+    }
+
+    private static func prove(_ manifest: HelperSmokeManifest, client: HelperClient, trace: ProofTrace) async throws {
         let a = manifest.tunnels[0], b = manifest.tunnels[1]
 
         _ = try await client.send(.up(tunnelID: a.id, config: a.configText))
@@ -65,26 +105,32 @@ enum HelperSmoke {
         let (firstA, firstB) = try await liveInterfaces(a, b, client: client)
         guard firstA != firstB else { throw Failure("Both tunnels report the same interface.") }
         print("Two tunnels up on distinct interfaces.")
-        try await probeBoth(a, b, client: client)
+        try await probeBoth(a, b, client: client, trace: trace)
 
         for cycle in 1...manifest.restartCount {
+            trace.phase = "restart\(cycle)/down"
             let down = try await client.send(.down(tunnelID: a.id))
             guard !down.tunnels.contains(where: { $0.tunnelID == a.id }) else { throw Failure("Restart \(cycle): A is still tracked after down.") }
             guard let survivor = down.tunnels.first(where: { $0.tunnelID == b.id }), survivor.alive, survivor.interface == firstB else {
                 throw Failure("Restart \(cycle): B changed or died while A went down.")
             }
-            try await probeWithCounters(b, client: client)
+            trace.phase = "restart\(cycle)/survivor"
+            try await probeWithCounters(b, client: client, trace: trace)
+            trace.phase = "restart\(cycle)/down-probe"
             if await rawProbe(a, timeout: downProbeTimeout) {
                 throw Failure("Restart \(cycle): A still answered while down, so that traffic was not using the tunnel.")
             }
 
+            trace.phase = "restart\(cycle)/up"
             _ = try await client.send(.up(tunnelID: a.id, config: a.configText))
             let (_, sameB) = try await liveInterfaces(a, b, client: client)
             guard sameB == firstB else { throw Failure("Restart \(cycle): B's interface changed.") }
-            try await probeBoth(a, b, client: client)
+            trace.phase = "restart\(cycle)/re-probe"
+            try await probeBoth(a, b, client: client, trace: trace)
             print("Restart \(cycle) of \(manifest.restartCount) passed; B stayed up.")
         }
 
+        trace.phase = "final"
         let ended = try await client.send(.downAll)
         guard ended.tunnels.isEmpty, !ended.dnsManaged else { throw Failure("Tunnels or DNS management remain after downAll.") }
     }
@@ -98,19 +144,29 @@ enum HelperSmoke {
         return (liveA.interface, liveB.interface)
     }
 
-    private static func probeBoth(_ a: HelperSmokeManifest.Tunnel, _ b: HelperSmokeManifest.Tunnel, client: HelperClient) async throws {
+    private static func probeBoth(_ a: HelperSmokeManifest.Tunnel, _ b: HelperSmokeManifest.Tunnel, client: HelperClient, trace: ProofTrace) async throws {
         // Started together, so each answer is received while the other tunnel is carrying traffic too.
         async let answeredA = rawProbeWithRetries(a)
         async let answeredB = rawProbeWithRetries(b)
         let results = await (answeredA, answeredB)
-        guard results.0, results.1 else { throw Failure("A tunnel did not return its token.") }
+        guard results.0.last?.matches == true, results.1.last?.matches == true else {
+            trace.probeLines = [
+                formatProbeDiagnostic(tunnel: "A", phase: trace.phase, attempts: results.0),
+                formatProbeDiagnostic(tunnel: "B", phase: trace.phase, attempts: results.1),
+            ]
+            throw Failure("A tunnel did not return its token.")
+        }
         try await verifyCounters(a, client: client)
         try await verifyCounters(b, client: client)
     }
 
-    private static func probeWithCounters(_ tunnel: HelperSmokeManifest.Tunnel, client: HelperClient) async throws {
+    private static func probeWithCounters(_ tunnel: HelperSmokeManifest.Tunnel, client: HelperClient, trace: ProofTrace) async throws {
         let before = try await peer(of: tunnel, client: client)
-        guard await rawProbeWithRetries(tunnel) else { throw Failure("A surviving tunnel did not return its token.") }
+        let attempts = await rawProbeWithRetries(tunnel)
+        guard attempts.last?.matches == true else {
+            trace.probeLines = [formatProbeDiagnostic(tunnel: "B", phase: trace.phase, attempts: attempts)]
+            throw Failure("A surviving tunnel did not return its token.")
+        }
         let after = try await peer(of: tunnel, client: client)
         guard after.rxBytes > before.rxBytes, after.txBytes > before.txBytes else {
             throw Failure("A probe answered without moving the tunnel's counters.")
@@ -132,19 +188,30 @@ enum HelperSmoke {
         return stats
     }
 
-    private static func rawProbeWithRetries(_ tunnel: HelperSmokeManifest.Tunnel) async -> Bool {
+    /// Stops at the first match, so the last attempt says whether the probe succeeded.
+    private static func rawProbeWithRetries(_ tunnel: HelperSmokeManifest.Tunnel) async -> [SmokeProbeAttempt] {
+        var attempts: [SmokeProbeAttempt] = []
         for _ in 0..<probeAttempts {
-            if await rawProbe(tunnel, timeout: probeTimeout) { return true }
+            let attempt = await probeAttempt(tunnel, timeout: probeTimeout)
+            attempts.append(attempt)
+            if attempt.matches { break }
         }
-        return false
+        return attempts
     }
 
     private static func rawProbe(_ tunnel: HelperSmokeManifest.Tunnel, timeout: TimeInterval) async -> Bool {
-        guard let port = NWEndpoint.Port(rawValue: UInt16(tunnel.probePort)) else { return false }
-        let response: String = await withCheckedContinuation { continuation in
-            TCPProbe(host: tunnel.probeHost, port: port, timeout: timeout) { continuation.resume(returning: $0) }.start()
+        await probeAttempt(tunnel, timeout: timeout).matches
+    }
+
+    private static func probeAttempt(_ tunnel: HelperSmokeManifest.Tunnel, timeout: TimeInterval) async -> SmokeProbeAttempt {
+        guard let port = NWEndpoint.Port(rawValue: UInt16(tunnel.probePort)) else {
+            return SmokeProbeAttempt(progress: SmokeProbeProgress(), response: "", receivedBytes: 0, token: tunnel.expectedToken)
         }
-        return smokeResponseMatches(response, token: tunnel.expectedToken)
+        return await withCheckedContinuation { continuation in
+            TCPProbe(host: tunnel.probeHost, port: port, timeout: timeout) { response, bytes, progress in
+                continuation.resume(returning: SmokeProbeAttempt(progress: progress, response: response, receivedBytes: bytes, token: tunnel.expectedToken))
+            }.start()
+        }
     }
 }
 
@@ -306,6 +373,12 @@ extension HelperSmoke {
 
 /// Fixed read-only commands for the full-route proof, with a deadline. Nothing else in the protocol is ever reached.
 private final class ReadOnlyCommands: CommandRunning {
+    private let maxTimeout: TimeInterval
+
+    init(maxTimeout: TimeInterval = .infinity) {
+        self.maxTimeout = maxTimeout
+    }
+
     func run(_ executable: String, _ args: [String], timeout: TimeInterval, readyMarker: String?) -> CommandResult {
         let process = Process()
         let pipe = Pipe()
@@ -321,7 +394,7 @@ private final class ReadOnlyCommands: CommandRunning {
             return CommandResult(status: 126, output: "")
         }
         let watchdog = DispatchWorkItem { process.terminate() }
-        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
+        DispatchQueue.global().asyncAfter(deadline: .now() + min(timeout, maxTimeout), execute: watchdog)
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         watchdog.cancel()
@@ -342,9 +415,10 @@ private final class TCPProbe {
     private let timeout: TimeInterval
     private let queue = DispatchQueue(label: "com.marcuschiu.WireNest.smoke-probe")
     private var received = Data()
-    private var completion: ((String) -> Void)?
+    private var progress = SmokeProbeProgress()
+    private var completion: ((String, Int, SmokeProbeProgress) -> Void)?
 
-    init(host: String, port: NWEndpoint.Port, timeout: TimeInterval, completion: @escaping (String) -> Void) {
+    init(host: String, port: NWEndpoint.Port, timeout: TimeInterval, completion: @escaping (String, Int, SmokeProbeProgress) -> Void) {
         connection = NWConnection(host: NWEndpoint.Host(host), port: port, using: .tcp)
         request = Data("GET /\(UUID().uuidString) HTTP/1.1\r\nHost: \(host)\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n".utf8)
         self.timeout = timeout
@@ -354,23 +428,56 @@ private final class TCPProbe {
     func start() {
         connection.stateUpdateHandler = { [self] state in
             switch state {
+            case .preparing:
+                progress.reach(.preparing)
+            case .waiting(let error):
+                progress.reach(.waiting)
+                note(error)
             case .ready:
+                progress.reach(.ready)
                 connection.send(content: request, completion: .contentProcessed { [self] error in
-                    if error != nil { finish() } else { receive() }
+                    if let error {
+                        note(error)
+                        finish()
+                    } else {
+                        progress.reach(.sent)
+                        receive()
+                    }
                 })
-            case .failed, .cancelled:
+            case .failed(let error):
+                note(error)
+                finish()
+            case .cancelled:
                 finish()
             default:
                 break
             }
         }
         connection.start(queue: queue)
-        queue.asyncAfter(deadline: .now() + timeout) { [self] in finish() }
+        queue.asyncAfter(deadline: .now() + timeout) { [self] in
+            if completion != nil { progress.timedOut = true }
+            finish()
+        }
+    }
+
+    /// A category and a number only: the error's own text is free-form and could carry anything.
+    private func note(_ error: NWError) {
+        switch error {
+        case .posix(let code): progress.note(SmokeProbeError(category: .posix, code: code.rawValue))
+        case .dns(let code): progress.note(SmokeProbeError(category: .dns, code: code))
+        case .tls(let code): progress.note(SmokeProbeError(category: .tls, code: code))
+        default: progress.note(SmokeProbeError(category: .other, code: 0))
+        }
     }
 
     private func receive() {
         connection.receive(minimumIncompleteLength: 1, maximumLength: Self.maxBytes) { [self] data, _, isComplete, error in
-            if let data { received.append(data) }
+            if let data {
+                received.append(data)
+                progress.reach(.receivedData)
+            }
+            if isComplete { progress.reach(.endOfStream) }
+            if let error { note(error) }
             if isComplete || error != nil || received.count >= Self.maxBytes {
                 finish()
             } else {
@@ -383,6 +490,6 @@ private final class TCPProbe {
         guard let completion else { return }
         self.completion = nil
         connection.cancel()
-        completion(String(decoding: received, as: UTF8.self))
+        completion(String(decoding: received, as: UTF8.self), received.count, progress)
     }
 }
