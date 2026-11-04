@@ -9,6 +9,11 @@ on:
         description: Version to stamp into the app, such as 0.1.0
         required: false
         default: 0.1.0
+      full_route_proof:
+        description: Also run the default-route experiment on this disposable hosted VM
+        type: boolean
+        required: false
+        default: false
   workflow_call:
     inputs:
       version:
@@ -90,3 +95,9 @@ jobs:
       - name: Real app-to-root-helper smoke test
         timeout-minutes: 10
         run: bash scripts/smoke-helper.sh .build/packaging/from-dmg/WireNest.app .build/packaging/smoke-peer
+      # Captures the VM's default route, so it needs a manual dispatch and never runs on a
+      # push or release. Keep it last: no later step may run or upload after the experiment.
+      - name: Optional full-route smoke test
+        if: github.event_name == 'workflow_dispatch' && inputs.full_route_proof == true
+        timeout-minutes: 10
+        run: bash scripts/smoke-full-route.sh .build/packaging/from-dmg/WireNest.app .build/packaging/smoke-peer

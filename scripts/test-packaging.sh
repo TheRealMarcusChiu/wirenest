@@ -146,5 +146,58 @@ done
 # Blocked until lane C's script is integrated: CI would otherwise fail much later on a Mac.
 [[ -f scripts/smoke-helper.sh ]] && pass "scripts/smoke-helper.sh present" || fail "scripts/smoke-helper.sh is missing from this checkout"
 
+# The full-route experiment captures the default route, so only an explicit manual dispatch
+# may start it, after the mandatory helper proof. Static checks: nothing here runs it.
+full_route_run='run: bash scripts/smoke-full-route.sh .build/packaging/from-dmg/WireNest.app .build/packaging/smoke-peer'
+full_route_if="if: github.event_name == 'workflow_dispatch' && inputs.full_route_proof == true"
+full_route_is_opt_in() {
+  local workflow=$1 release=$2 dispatch call input options helper run
+  dispatch=$(grep -nx '  workflow_dispatch:' "$workflow" | cut -d: -f1 || true)
+  call=$(grep -nx '  workflow_call:' "$workflow" | cut -d: -f1 || true)
+  input=$(grep -nE '^ *full_route_proof:' "$workflow" | cut -d: -f1 || true)
+  helper=$(grep -nFx "        $helper_run" "$workflow" | cut -d: -f1 || true)
+  run=$(grep -nFx "        $full_route_run" "$workflow" | cut -d: -f1 || true)
+  [[ $dispatch =~ ^[0-9]+$ && $call =~ ^[0-9]+$ && $input =~ ^[0-9]+$ && $helper =~ ^[0-9]+$ && $run =~ ^[0-9]+$ ]] || return 1
+  [[ $dispatch -lt $input && $input -lt $call && $helper -lt $run ]] || return 1
+  options=$(awk -v start="$input" 'NR > start { if (!/^        /) exit; print }' "$workflow")
+  [[ $'\n'$options$'\n' == *$'\n        type: boolean\n'* && $'\n'$options$'\n' == *$'\n        default: false\n'* ]] || return 1
+  [[ $(sed -n "$((run - 1))p" "$workflow") == '        timeout-minutes: 10' ]] || return 1
+  [[ $(sed -n "$((run - 2))p" "$workflow") == "        $full_route_if" ]] || return 1
+  [[ $(sed -n "$((run - 3))p" "$workflow") == '      - name: '* ]] || return 1
+  [[ $run -eq $(grep -c '' "$workflow") && $(grep -c 'smoke-full-route' "$workflow") -eq 1 ]] || return 1
+  ! grep -q 'full_route_proof' "$release" && helper_step_is_gated "$workflow"
+}
+release=.github/workflows/release.yml
+full_route_is_opt_in "$workflow" "$release" && pass "full-route proof is manual opt-in only" || fail "full-route step is missing or not opt-in"
+full_route_line=$(grep -nFx "        $full_route_run" "$workflow" | cut -d: -f1 || true)
+if [[ -n $full_route_line ]]; then
+  sed 's/^        default: false$/        default: true/' "$workflow" >"$scratch/on-by-default.yml"
+  sed 's/^        type: boolean$/        type: string/' "$workflow" >"$scratch/not-boolean.yml"
+  grep -Fv 'inputs.full_route_proof == true' "$workflow" >"$scratch/unconditional.yml"
+  sed "s/^        if: github.event_name == .*/        if: always()/" "$workflow" >"$scratch/always.yml"
+  sed "s/^        if: github.event_name == .*/        if: inputs.full_route_proof == true/" "$workflow" >"$scratch/any-event.yml"
+  sed 's#run: bash scripts/smoke-full-route#run: sudo bash scripts/smoke-full-route#' "$workflow" >"$scratch/root.yml"
+  sed "$((full_route_line - 1))s/timeout-minutes: 10/timeout-minutes: 45/" "$workflow" >"$scratch/long.yml"
+  sed "$((full_route_line - 1))d" "$workflow" >"$scratch/unbounded.yml"
+  awk '{print} /^  workflow_call:$/ {print "      full_route_proof:"}' "$workflow" >"$scratch/callable.yml"
+  { cat "$workflow"; echo '      - name: Later step'; } >"$scratch/not-last.yml"
+  sed -n "$((full_route_line - 3)),${full_route_line}p" "$workflow" >"$scratch/step"
+  sed "$((full_route_line - 3)),${full_route_line}d" "$workflow" |
+    awk -v step="$scratch/step" '/- name: Real app-to-root-helper/ { while ((getline line <step) > 0) print line } {print}' >"$scratch/premature.yml"
+  sed 's#run: bash scripts/smoke-helper#run: sudo bash scripts/smoke-helper#' "$workflow" >"$scratch/helper-weakened.yml"
+  for variant in on-by-default not-boolean unconditional always any-event root long unbounded callable not-last premature helper-weakened; do
+    full_route_is_opt_in "$scratch/$variant.yml" "$release" && fail "full-route gate accepted the $variant variant" || pass "full-route gate rejected the $variant variant"
+  done
+  { cat "$release"; echo '      full_route_proof: true'; } >"$scratch/release.yml"
+  full_route_is_opt_in "$workflow" "$scratch/release.yml" && fail "full-route gate accepted a release call" || pass "full-route gate rejected a release call"
+fi
+
+# Deliberately not a failure: this step only runs on manual dispatch, so normal CI doesn't need the script.
+if [[ -f scripts/smoke-full-route.sh ]]; then
+  echo "note: scripts/smoke-full-route.sh present; not run by these checks"
+else
+  echo "note: scripts/smoke-full-route.sh not in this checkout; dispatching with full_route_proof=true would fail until it is integrated"
+fi
+
 [[ $fails -eq 0 ]] || die "$fails check(s) failed"
 echo "All packaging self-checks passed."

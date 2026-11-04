@@ -90,3 +90,9 @@ CI is configured to run `scripts/smoke-helper.sh` on both architectures after th
 **It hasn't run or passed yet**, and an app without the pending root helper fixes is expected to fail it. It runs only on disposable CI machines and is not an install method.
 
 Even once it passes, it won't cover the menu-bar UI, Wi-Fi rules, start at login, sleep/wake, or WireNest changing DNS. It can't show that the whole app is ready for production use.
+
+### Optional full-route proof
+
+`scripts/smoke-full-route.sh` deliberately captures a machine's default route, so CI never runs it on a push or release. It runs only when someone starts the macOS workflow manually with `full_route_proof` set to true, and only after the root helper proof has passed in that job.
+
+**It hasn't run or passed yet.** It only runs on disposable GitHub-hosted machines, and you shouldn't run it on your own Mac. Even once it passes, it won't cover real VPN servers, the menu-bar UI, Wi-Fi rules, start at login, sleep/wake, a kill switch, or routing on a physical Mac.
