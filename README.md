@@ -2,9 +2,13 @@
 
 WireNest is a native macOS menu-bar app for WireGuard. It keeps named connections, each holding one or more tunnels you can switch on and off separately, and runs one connection at a time.
 
-It requires macOS 13 or later. It has not been tested on real Mac hardware, so treat it as early software. See [What has been tested](#what-has-been-tested).
+It requires macOS 13 or later.
+
+> **There is no installer release yet.** Security and behavior fixes to the root helper are still pending. WireNest has not been tested on real Mac hardware or with real VPN servers, so don't rely on it to protect real traffic. See [What has been tested](#what-has-been-tested).
 
 ## Features
+
+These are implemented, but most have not been tested end to end.
 
 - **Connections:** create several, each with its own tunnels, and turn the active one on, off, or switch to another. If you disconnect, it stays off, even after a restart.
 - **Private imports:** importing a `.conf` file copies it into storage only your account can read. Later changes to the original have no effect.
@@ -16,6 +20,8 @@ It requires macOS 13 or later. It has not been tested on real Mac hardware, so t
 - **Start at login:** optionally reopen WireNest and restore your connection when you log in.
 
 ## Install
+
+These steps apply once a release is published. There isn't one yet.
 
 Download the DMG for your Mac from [Releases](https://github.com/TheRealMarcusChiu/wirenest/releases): `arm64` for Apple silicon, `x86_64` for Intel. Open it and drag WireNest to Applications.
 
@@ -47,16 +53,30 @@ WireGuard tunnels need root to create network interfaces and change routes, so W
 
 ## What has been tested
 
-GitHub Actions does the following on one Apple silicon and one Intel runner, both on macOS 15:
+[CI run 41753758485](https://github.com/TheRealMarcusChiu/wirenest/actions/runs/41753758485), at commit `6ae7ce0`, passed all of the following on GitHub's Apple silicon and Intel macOS 15 runners:
 
-- Runs the Swift tests and builds the app.
-- Builds the bundled tools and checks that they link only system libraries.
-- Creates and verifies the DMG, then starts the app and helper binaries from it briefly to confirm that they load.
-- Runs a real two-tunnel test with `scripts/smoke-two-tunnels.sh`.
+- All 112 Swift tests.
+- Maintainer signature checks on the upstream sources.
+- Building the app and bundled tools, and checking that they link only system libraries.
+- Creating, mounting, and checking the DMG.
+- Starting the app and helper binaries from the DMG to confirm that they load. This shows nothing about helper installation, IPC, or caller authentication.
+- A real two-tunnel test with `scripts/smoke-two-tunnels.sh`.
 
-That test uses the bundled `bash`, `wg`, `wg-quick`, and `wireguard-go`. It starts two tunnels with throwaway keys to peers on the same machine, sends TCP traffic through each, stops one while the other keeps working, and confirms that the default route and DNS didn't change.
+That test uses the bundled `bash`, `wg`, `wg-quick`, and `wireguard-go` directly, without the app or helper. It starts two tunnels with throwaway keys to peers on the same machine, sends TCP traffic through each, stops one while the other keeps working, and confirms that the default route and DNS didn't change.
 
-**Automated tests don't cover** the menu-bar UI, helper installation, WireNest's DNS management, sleep/wake recovery, network rules, real VPN servers, or macOS 13 and 14. Those need testing on a real Mac.
+**Not tested yet:**
+
+- The app and helper running a tunnel together
+- Root helper installation and IPC
+- WireNest's DNS changes and restoration
+- Failure recovery and sleep/wake handling
+- Using the menu-bar UI
+- Wi-Fi and public IP rules on a live network
+- Start at login
+- Real VPN servers and physical Mac hardware
+- macOS 13 and 14
+
+[docs/security.md](docs/security.md#what-has-been-verified) has the full breakdown.
 
 ## Build from source
 

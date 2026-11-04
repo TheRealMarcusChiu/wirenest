@@ -8,4 +8,4 @@ Download the DMG for your Mac: `arm64` for Apple silicon, `x86_64` for Intel. Ea
 
 Reconnecting a tunnel interrupts its traffic. Tunnels start after you log in, not before.
 
-`WireNest-third-party-sources.tar` contains the source for the bundled GPL and WireGuard tools. See `THIRD_PARTY_NOTICES.md`.
+`WireNest-third-party-sources.tar` contains the source for the bundled GPL and WireGuard tools, the WireNest source and build scripts for this release, and rebuild instructions. See `THIRD_PARTY_NOTICES.md`.

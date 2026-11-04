@@ -19,7 +19,17 @@ WireNest bundles the programs below in `WireNest.app/Contents/Resources/Tools` a
 
 ## Source code for the GPL components
 
-Each release includes `WireNest-third-party-sources.tar`, which contains the exact bash tarball and patches, the wireguard-tools tarball, and the wireguard-go tarball used for that release. `scripts/build-tools.sh` in this repository holds the build instructions, and `scripts/deps.sh` lists the SHA-256 pin of every input.
+Each release is published with `WireNest-third-party-sources.tar`, which contains:
+
+- The exact bash tarball and patches, wireguard-tools tarball, and wireguard-go tarball used for that release, with their upstream license files.
+- The WireNest source tree for that release, including the scripts that build these tools and package them into the app.
+- `scripts/deps.sh`, which lists the SHA-256 hash of each input.
+- `SOURCE-REVISION.txt`, which names the WireNest commit.
+- `README-SOURCES.md`, which has the rebuild instructions.
+
+CI fails if any of these required files is missing from the archive, or if the third-party files don't match their hashes.
+
+A rebuild also downloads the Go toolchain and the Go modules that `wireguard-go` uses. These aren't in the archive and aren't GPL-licensed. Xcode and the macOS SDK come from Apple and aren't included either.
 
 ## Used only for testing
 
