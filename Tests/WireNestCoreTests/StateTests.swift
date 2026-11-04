@@ -116,11 +116,11 @@ final class StateTests: XCTestCase {
         let other = state.addProfile(name: "Home")
         _ = try importConf(&state, confText(address: "10.3.0.2/32", allowedIPs: "10.3.0.0/24"), into: other)
 
-        XCTAssertEqual(try state.desiredTunnels().map(\.id), [])
-        try state.connect(profile, pinContext: nil)
-        XCTAssertEqual(try state.desiredTunnels().map(\.id), [a, b])
+        XCTAssertEqual(try state.desiredTunnels(ssid: noWiFi).map(\.id), [])
+        try state.connect(profile, pinContext: nil, ssid: noWiFi)
+        XCTAssertEqual(try state.desiredTunnels(ssid: noWiFi).map(\.id), [a, b])
         try state.setTunnelEnabled(a, false)
-        XCTAssertEqual(try state.desiredTunnels().map(\.id), [b])
+        XCTAssertEqual(try state.desiredTunnels(ssid: noWiFi).map(\.id), [b])
     }
 
     // MARK: connect / disconnect
@@ -128,7 +128,7 @@ final class StateTests: XCTestCase {
     func testManualDisconnectPersistsOffAcrossReload() throws {
         var (state, profile) = stateWithProfile()
         _ = try importConf(&state, confText(), into: profile)
-        try state.connect(profile, pinContext: nil)
+        try state.connect(profile, pinContext: nil, ssid: noWiFi)
         state.disconnect()
 
         let store = try StateStore(directory: tempDirectory().appendingPathComponent("s"))
@@ -137,25 +137,25 @@ final class StateTests: XCTestCase {
         XCTAssertFalse(reloaded.connectionOn)
         XCTAssertTrue(reloaded.manualOff)
         XCTAssertEqual(reloaded.activeProfileID, profile)
-        XCTAssertEqual(try reloaded.desiredTunnels(), [])
+        XCTAssertEqual(try reloaded.desiredTunnels(ssid: noWiFi), [])
     }
 
     func testConnectClearsManualOffAndRestoresDesiredAfterReload() throws {
         var (state, profile) = stateWithProfile()
         let t = try importConf(&state, confText(), into: profile)
         state.disconnect()
-        try state.connect(profile, pinContext: "ssid:home")
+        try state.connect(profile, pinContext: "ssid:home", ssid: noWiFi)
         XCTAssertFalse(state.manualOff)
         XCTAssertEqual(state.pinnedContext, "ssid:home")
 
         let store = try StateStore(directory: tempDirectory().appendingPathComponent("s"))
         try store.save(state)
-        XCTAssertEqual(try store.load().desiredTunnels().map(\.id), [t])
+        XCTAssertEqual(try store.load().desiredTunnels(ssid: noWiFi).map(\.id), [t])
     }
 
     func testConnectRefusesConflictingOrEmptyProfile() throws {
         var (state, profile) = stateWithProfile()
-        XCTAssertThrowsError(try state.connect(profile, pinContext: nil))
+        XCTAssertThrowsError(try state.connect(profile, pinContext: nil, ssid: noWiFi))
         XCTAssertFalse(state.connectionOn)
 
         _ = try importConf(&state, confText(address: "10.1.0.2/32", allowedIPs: "10.1.0.0/24"), into: profile)
@@ -163,7 +163,7 @@ final class StateTests: XCTestCase {
         // A hand-edited or legacy state file can hold a conflict; connect must still refuse it.
         state.profiles[0].tunnels[1].configText = confText(address: "10.2.0.2/32", allowedIPs: "10.1.0.0/24")
         XCTAssertTrue(state.tunnel(b)!.enabled)
-        XCTAssertThrowsError(try state.connect(profile, pinContext: nil))
+        XCTAssertThrowsError(try state.connect(profile, pinContext: nil, ssid: noWiFi))
         XCTAssertFalse(state.connectionOn)
     }
 
@@ -171,7 +171,7 @@ final class StateTests: XCTestCase {
         var (state, profile) = stateWithProfile()
         _ = try importConf(&state, confText(), into: profile)
         state.rules = [NetworkRule(condition: .ssidEquals("x"), profileID: profile)]
-        try state.connect(profile, pinContext: nil)
+        try state.connect(profile, pinContext: nil, ssid: noWiFi)
         state.removeProfile(profile)
         XCTAssertFalse(state.connectionOn)
         XCTAssertNil(state.activeProfileID)

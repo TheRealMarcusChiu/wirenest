@@ -21,6 +21,8 @@ public struct ConnectionProfile: Codable, Identifiable, Equatable {
     public var tunnels: [SavedTunnel]
     public var primaryDNS: String
     public var secondaryDNS: String
+    /// Where this connection may run at all; nil means anywhere. Optional so older saved state still decodes.
+    public var ssidEligibility: SSIDEligibility?
 
     public init(id: UUID = UUID(), name: String, tunnels: [SavedTunnel] = [], primaryDNS: String = "", secondaryDNS: String = "") {
         self.id = id
@@ -32,12 +34,43 @@ public struct ConnectionProfile: Codable, Identifiable, Equatable {
 
     /// Empty means “leave system DNS alone”.
     public var dnsServers: [String] { [primaryDNS, secondaryDNS].filter { !$0.isEmpty } }
+
+    /// Why this connection may not run on `ssid`, or nil if it may.
+    public func ineligibilityReason(_ ssid: SSIDObservation) -> String? {
+        guard let ssidEligibility, !ssidEligibility.allows(ssid) else { return nil }
+        let current: String
+        switch ssid {
+        case .known(let name): current = "The current Wi-Fi is “\(name)”."
+        case .unavailable(let reason): current = "The Wi-Fi name is unavailable: \(reason)."
+        }
+        switch ssidEligibility {
+        case .onlyEquals(let name): return "“\(self.name)” runs only on Wi-Fi “\(name)”. \(current)"
+        case .onlyNotEquals(let name): return "“\(self.name)” runs only on a known Wi-Fi other than “\(name)”. \(current)"
+        }
+    }
+}
+
+/// A hard limit on where a connection may run. Separate from `NetworkRule`, which only picks a connection.
+public enum SSIDEligibility: Codable, Equatable {
+    case onlyEquals(String)
+    case onlyNotEquals(String)
+
+    /// An unknown SSID qualifies for neither mode: it may well be the excluded network.
+    public func allows(_ ssid: SSIDObservation) -> Bool {
+        guard let current = ssid.name else { return false }
+        switch self {
+        case .onlyEquals(let name): return current == name
+        case .onlyNotEquals(let name): return current != name
+        }
+    }
 }
 
 public enum RuleCondition: Codable, Equatable {
     case ssidEquals(String)
     case ssidNotEquals(String)
     case publicIPInRange(String)
+    /// Fires once when the stable physical public IP changes from one known address to another.
+    case publicIPChanges
 }
 
 public struct NetworkRule: Codable, Identifiable, Equatable {
@@ -71,6 +104,10 @@ public struct DesiredTunnel: Equatable {
 public struct ImportOutcome: Equatable {
     public let tunnelID: UUID
     public let conflicts: [RouteConflict]
+    /// Taken from the file into the connection's blank DNS settings.
+    public let seededDNS: [String]
+    /// In the file but not used: runtime DNS comes only from the connection's settings.
+    public let ignoredDNS: [String]
 }
 
 public struct StateError: LocalizedError, Equatable {
@@ -156,6 +193,24 @@ public struct AppState: Codable, Equatable {
         profiles[index].secondaryDNS = secondary
     }
 
+    public mutating func setSSIDEligibility(_ id: UUID, _ eligibility: SSIDEligibility?) throws {
+        guard let index = profiles.firstIndex(where: { $0.id == id }) else { throw StateError("Connection no longer exists.") }
+        var cleaned = eligibility
+        switch eligibility {
+        case .onlyEquals(let name)?: cleaned = .onlyEquals(try validatedSSID(name))
+        case .onlyNotEquals(let name)?: cleaned = .onlyNotEquals(try validatedSSID(name))
+        case nil: break
+        }
+        profiles[index].ssidEligibility = cleaned
+    }
+
+    private func validatedSSID(_ name: String) throws -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Wi-Fi limits an SSID to 32 bytes, so a longer name could never match.
+        guard (1...32).contains(trimmed.utf8.count) else { throw StateError("Enter a Wi-Fi name of 1 to 32 bytes.") }
+        return trimmed
+    }
+
     // MARK: Tunnels
 
     public mutating func importTunnel(fileAt url: URL, into profileID: UUID) throws -> ImportOutcome {
@@ -177,8 +232,18 @@ public struct AppState: Codable, Equatable {
         let config = try WireGuardConfig.parse(text)
         let conflicts = try conflictsWithEnabled(config, name: name, in: profiles[index], excluding: nil)
         let tunnel = SavedTunnel(name: name, enabled: conflicts.isEmpty, configText: config.storedText)
+        // Only the first tunnel of a connection with no DNS of its own speaks for the connection.
+        var seeded: [String] = []
+        if profiles[index].tunnels.isEmpty, profiles[index].primaryDNS.isEmpty {
+            seeded = Array(config.dnsEntries.filter(isIPAddress).prefix(2))
+            profiles[index].primaryDNS = seeded.first ?? ""
+            profiles[index].secondaryDNS = seeded.dropFirst().first ?? ""
+        }
         profiles[index].tunnels.append(tunnel)
-        return ImportOutcome(tunnelID: tunnel.id, conflicts: conflicts)
+        return ImportOutcome(
+            tunnelID: tunnel.id, conflicts: conflicts, seededDNS: seeded,
+            ignoredDNS: config.dnsEntries.filter { !seeded.contains($0) }
+        )
     }
 
     /// The copy starts disabled because it necessarily overlaps its source.
@@ -227,8 +292,9 @@ public struct AppState: Codable, Equatable {
 
     // MARK: Connect / disconnect
 
-    public mutating func connect(_ profileID: UUID, pinContext: String?) throws {
+    public mutating func connect(_ profileID: UUID, pinContext: String?, ssid: SSIDObservation) throws {
         guard let target = profile(profileID) else { throw StateError("Connection no longer exists.") }
+        if let reason = target.ineligibilityReason(ssid) { throw StateError(reason) }
         _ = try Self.resolveEnabledTunnels(target, requireAny: true)
         activeProfileID = profileID
         connectionOn = true
@@ -243,9 +309,16 @@ public struct AppState: Codable, Equatable {
     }
 
     /// What should be running right now. Throws rather than returning a partial set if the saved data conflicts.
-    public func desiredTunnels() throws -> [DesiredTunnel] {
-        guard connectionOn, let id = activeProfileID, let active = profile(id) else { return [] }
+    /// The single gate for every start path, so login restore and retries cannot bypass SSID eligibility.
+    public func desiredTunnels(ssid: SSIDObservation) throws -> [DesiredTunnel] {
+        guard connectionOn, let id = activeProfileID, let active = profile(id), active.ineligibilityReason(ssid) == nil else { return [] }
         return try Self.resolveEnabledTunnels(active, requireAny: false)
+    }
+
+    /// Why a connection the user left on is not running. This is not a disconnect: it resumes when eligible again.
+    public func pauseReason(ssid: SSIDObservation) -> String? {
+        guard connectionOn, let id = activeProfileID else { return nil }
+        return profile(id)?.ineligibilityReason(ssid)
     }
 
     private static func resolveEnabledTunnels(_ profile: ConnectionProfile, requireAny: Bool) throws -> [DesiredTunnel] {

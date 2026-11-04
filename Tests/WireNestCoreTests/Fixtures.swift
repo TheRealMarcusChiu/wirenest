@@ -6,6 +6,9 @@ func testKey(_ seed: UInt8) -> String {
     Data(repeating: seed, count: 32).base64EncodedString()
 }
 
+/// An unknown SSID, which only unrestricted connections may run under.
+let noWiFi = SSIDObservation.unavailable("test")
+
 func confText(
     privateKey: String = testKey(1),
     address: String = "10.10.0.2/32",

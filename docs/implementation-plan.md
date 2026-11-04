@@ -116,23 +116,46 @@ Error messages never echo values.
 
 Checked per pair in input order, and refused by default:
 
-- overlapping `AllowedIPs` or `Address` across tunnels;
+- overlapping `AllowedIPs` or `Address` across tunnels, where a `/0` overlaps every route and address
+  of its family in another tunnel;
 - two owners of the same family's `/0`;
-- an IP-literal endpoint inside another tunnel's routes;
+- an IP-literal endpoint inside another tunnel's routes, including its `/0`;
 - the same `ListenPort`.
 
-`Table = off` installs no routes, so its `AllowedIPs` are exempt, but its addresses are still checked.
+Disabled tunnels are ignored. `Table = off` installs no routes, so its `AllowedIPs` are exempt, but its
+addresses are still checked.
 
-**Limits.** A `/0` does not conflict with a narrower route in another tunnel, because wg-quick
-installs it as two `/1` routes and longest-prefix match decides. That other tunnel's encrypted packets
-then travel through the default tunnel: wg-quick pins direct endpoint routes only for the tunnel that
-owns the default. Hostname endpoints cannot be checked before resolution. Conflicts with routes
-outside WireNest are not detected.
+There is deliberately no exception for a full tunnel beside a split tunnel. wg-quick installs `/0` as
+two `/1` routes, so longest-prefix match cannot decide against another `/1`, and each tunnel's wg-quick
+manages its endpoint routes alone.
+
+**Limits.** Hostname endpoints cannot be checked before resolution. Conflicts with routes outside
+WireNest are not detected.
+
+### SSID eligibility
+
+A connection can be limited to run only on a named Wi-Fi network, or only on a known Wi-Fi network other
+than a named one. This is a hard limit, separate from rules, which only choose a connection.
+
+`AppState.desiredTunnels(ssid:)` is the single gate for login restore, retries and every reconcile, and
+the app re-reads the SSID before each `up`. On a disallowed network a connection the user left on
+*pauses*: its tunnels stop, the helper restores DNS after the last one, and `connectionOn` stays true
+with `manualOff` false, so it resumes when allowed. An explicit disconnect still wins. A manual connect
+on a disallowed network is refused with the reason, and rules skip disallowed targets.
+
+An unknown SSID (no Location permission, Wi-Fi off, Ethernet only) satisfies neither mode.
+
+**Limits.** Enforcement lives in the app, not the helper, which cannot see the SSID, so tunnels already
+running stay up if the app is force quit. A Wi-Fi name that is briefly unavailable, for example on wake,
+stops a limited connection until the name returns. The check runs on network events and every 5 seconds,
+so a disallowed tunnel can outlive a network change by that long. This is not a kill switch.
 
 ### DNS
 
 `DNS` lines are kept for reference but stripped from runtime configs, so `wg-quick` never touches DNS
-and tunnels cannot race. The helper snapshots each enabled network service to disk before its first
+and tunnels cannot race. The first tunnel imported into a connection with no DNS of its own fills in that
+connection's DNS from the file's first two IP entries, and the UI says so. Any other DNS in a file is
+reported as unused, and configured DNS is never overwritten. The helper snapshots each enabled network service to disk before its first
 change, re-applies idempotently, and restores after the last tunnel stops or on the next helper start
 if none survived. An empty primary leaves system DNS alone. Server order is not guaranteed failover.
 
@@ -168,7 +191,8 @@ quit, tunnels keep running and the next launch adopts them.
 Rules run in list order and the first match wins. Each selects a connection and connects it; a rule
 never disconnects. A candidate must hold for 5 s, with at least 30 s between automatic switches.
 `manualOff` blocks rules until the user connects. A manual connect pins the current network context until
-a *known* different context appears, so an unavailable SSID never releases a pin.
+a *known* value contradicts it or a real public IP change occurs, so an unavailable SSID or a failed
+probe never releases a pin.
 
 An unavailable SSID satisfies no rule, including "Wi-Fi is not" (fail closed). The UI shows the reason
 and the Location permission state.
@@ -179,6 +203,13 @@ HTTPS GET to a user-visible third-party URL, sent with no identifying data and b
 feedback. Two matching probes are needed to accept a change, and two failures make the address
 unknown, which matches no rule. Cadence is about 5 minutes, plus after network events.
 
+The "Public IP changes" rule needs no CIDR and fires once when the stable address moves from one known
+value to a different known value. The first address after launch is only a baseline, and the baseline
+survives failed probes, so failure followed by the same address is no change. Because it is kept in
+memory, a change while the app is not running is not detected. The event stays pending through debounce
+and dwell. It is dropped by `manualOff`, a holding pin, a disallowed target, or a higher-priority rule.
+After it fires, a pin holds the choice until the network changes again, so lower rules cannot flip it back.
+
 ## Test map
 
 | File | Covers |
@@ -186,7 +217,8 @@ unknown, which matches no rule. Cadence is about 5 minutes, plus after network e
 | `ConfigParserTests` | Directives, keys, addresses, endpoints, secret-free errors, round trip |
 | `RouteConflictTests` | CIDR math, every conflict kind, deterministic order |
 | `StateTests` | By-value import, duplicate, edit, toggles, manual off, persistence, permissions, corruption |
-| `RuleEngineTests` | SSID rules and fail-closed, priority, debounce, dwell, override, pin, public IP |
+| `RuleEngineTests` | SSID rules and fail-closed, priority, debounce, dwell, override, pin, public IP range and change trigger |
+| `NetworkPolicyTests` | SSID eligibility, pause and resume against the real engine, older state decoding, import DNS seeding |
 | `SupervisorTests` | Backoff, health table, per-tunnel restarts, no storms, adoption |
 | `HelperEngineTests` | Argv and file hygiene, boundary validation, DNS lifecycle, crash and boot recovery, install protocol |
 

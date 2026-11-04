@@ -26,9 +26,8 @@ public struct RouteConflictError: LocalizedError, Equatable {
 
 /// Reports at most one conflict per tunnel pair per kind, in input order.
 ///
-/// A `/0` route is exempt from overlap checks against other tunnels: wg-quick installs
-/// it as two `/1` routes, so another tunnel's narrower route deterministically wins by
-/// longest-prefix match. Two owners of the same family's default are never allowed.
+/// A `/0` conflicts with every route and address of its family in another tunnel. Each tunnel's
+/// wg-quick manages its routes and endpoints alone, so nothing here could own a safe exception.
 public func findRouteConflicts(_ tunnels: [NamedConfig]) -> [RouteConflict] {
     var conflicts: [RouteConflict] = []
     for (i, a) in tunnels.enumerated() {
@@ -50,18 +49,18 @@ private func conflictsBetween(_ a: NamedConfig, _ b: NamedConfig) -> [RouteConfl
     for isIPv6 in [false, true] {
         let hasDefault: ([CIDR]) -> Bool = { $0.contains { $0.isDefaultRoute && $0.isIPv6 == isIPv6 } }
         if hasDefault(routesA) && hasDefault(routesB) {
-            result.append(RouteConflict(
+            // This one fix is needed first, and every other overlap of a /0 would only repeat it.
+            return [RouteConflict(
                 kind: .multipleDefaultRoutes,
                 message: "“\(a.name)” and “\(b.name)” both claim the \(isIPv6 ? "IPv6" : "IPv4") default route. Only one tunnel can own it: disable one or narrow its AllowedIPs."
-            ))
-            break
+            )]
         }
     }
 
-    let specificA = routesA.filter { !$0.isDefaultRoute } + a.config.addresses
-    let specificB = routesB.filter { !$0.isDefaultRoute } + b.config.addresses
-    overlap: for routeA in specificA {
-        for routeB in specificB where routeA.overlaps(routeB) {
+    let coveredA = routesA + a.config.addresses
+    let coveredB = routesB + b.config.addresses
+    overlap: for routeA in coveredA {
+        for routeB in coveredB where routeA.overlaps(routeB) {
             result.append(RouteConflict(
                 kind: .overlappingRoutes,
                 message: "“\(a.name)” (\(routeA)) and “\(b.name)” (\(routeB)) overlap. Disable one tunnel or change its Address or AllowedIPs."
@@ -70,7 +69,7 @@ private func conflictsBetween(_ a: NamedConfig, _ b: NamedConfig) -> [RouteConfl
         }
     }
 
-    capture: for (owner, otherName, other) in [(a, b.name, specificB), (b, a.name, specificA)] {
+    capture: for (owner, otherName, other) in [(a, b.name, coveredB), (b, a.name, coveredA)] {
         for peer in owner.config.peers {
             guard let host = peer.endpoint?.host, let endpoint = CIDR(host) else { continue }
             if let route = other.first(where: { $0.overlaps(endpoint) }) {

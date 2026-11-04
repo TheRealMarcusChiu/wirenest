@@ -53,6 +53,7 @@ final class AppController: ObservableObject {
         observer.onNetworkEvent = { [weak self] in self?.networkEvent() }
         observer.onLocationChange = { [weak self] in self?.objectWillChange.send() }
         observer.start()
+        refreshSSID()
         loop = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.tick()
@@ -104,11 +105,15 @@ final class AppController: ObservableObject {
 
     private func tick() async {
         ticks += 1
-        let current = observer.currentSSID()
-        if current != ssid { ssid = current }
+        refreshSSID()
         probePublicIPIfDue()
         applyRules()
         await reconcile()
+    }
+
+    private func refreshSSID() {
+        let current = observer.currentSSID()
+        if current != ssid { ssid = current }
     }
 
     private func networkEvent() {
@@ -134,8 +139,8 @@ final class AppController: ObservableObject {
             persist()
         }
         guard let target else { return }
-        // A rule connects like a manual connect but leaves no pin, so the next network change can move it again.
-        if mutate({ try $0.connect(target, pinContext: nil) }) {
+        // Keeps only a pin the engine just set; otherwise the next network change can move this connection again.
+        if mutate({ try $0.connect(target, pinContext: $0.pinnedContext, ssid: ssid) }) {
             supervisor.retryAll()
             dnsDirty = true
         }
@@ -172,9 +177,10 @@ final class AppController: ObservableObject {
         }
         helperState = .ready
 
+        refreshSSID()
         let desired: [DesiredTunnel]
         do {
-            desired = try state.desiredTunnels()
+            desired = try state.desiredTunnels(ssid: ssid)
             connectionError = nil
         } catch {
             // Fail closed: a connection whose saved tunnels conflict does not run partially.
@@ -191,7 +197,12 @@ final class AppController: ObservableObject {
             }
         }
         for id in plan.start {
-            guard let tunnel = desired.first(where: { $0.id == id }) else { continue }
+            // The awaits above take seconds, and in that time the SSID or the user's choice may have forbidden this tunnel.
+            refreshSSID()
+            guard let tunnel = (try? state.desiredTunnels(ssid: ssid))?.first(where: { $0.id == id }) else {
+                needsAnotherPass = true
+                continue
+            }
             do {
                 status = try await helper.send(.up(tunnelID: id, config: tunnel.configText))
                 supervisor.noteStarted(id, now: Date())
@@ -206,7 +217,7 @@ final class AppController: ObservableObject {
 
     /// Re-applied after changes and periodically: networksetup settings can change, and new services can appear.
     private func applyDNS(status: HelperStatus, desired: [DesiredTunnel]) async {
-        guard !desired.isEmpty, !status.tunnels.isEmpty,
+        guard !desired.isEmpty, !status.tunnels.isEmpty, pauseReason == nil,
               let id = state.activeProfileID, let profile = state.profile(id) else { return }
         guard dnsDirty || ticks % Self.dnsRefreshTicks == 0 else { return }
         guard !profile.primaryDNS.isEmpty || status.dnsManaged else {
@@ -266,15 +277,21 @@ final class AppController: ObservableObject {
     // MARK: Connection actions
 
     var overallHealth: TunnelHealth {
-        guard state.connectionOn, helperState == .ready, connectionError == nil,
+        guard state.connectionOn, helperState == .ready, connectionError == nil, pauseReason == nil,
               let id = state.activeProfileID, let profile = state.profile(id) else { return .disconnected }
         let enabled = profile.tunnels.filter(\.enabled)
         return aggregateHealth(enabled.map { views[$0.id]?.state ?? .connecting })
     }
 
+    /// Set while a connection the user left on waits for an eligible Wi-Fi network.
+    var pauseReason: String? { state.pauseReason(ssid: ssid) }
+
+    var statusLabel: String { pauseReason == nil ? overallHealth.label : "Paused" }
+
     func connect(_ profileID: UUID) {
+        refreshSSID()
         let pin = snapshot().contextKey(includingPublicIP: state.publicIPAutomationEnabled)
-        if mutate({ try $0.connect(profileID, pinContext: pin) }) {
+        if mutate({ try $0.connect(profileID, pinContext: pin, ssid: ssid) }) {
             supervisor.retryAll()
             dnsDirty = true
             kick()
@@ -344,6 +361,13 @@ final class AppController: ObservableObject {
         }
     }
 
+    func setSSIDEligibility(_ id: UUID, _ eligibility: SSIDEligibility?) {
+        if mutate({ try $0.setSSIDEligibility(id, eligibility) }) {
+            if eligibility != nil, observer.locationStatus == .notDetermined { observer.requestLocationPermission() }
+            kick()
+        }
+    }
+
     func importFiles(into profileID: UUID) {
         let panel = NSOpenPanel()
         panel.title = "Import WireGuard Configuration"
@@ -361,6 +385,13 @@ final class AppController: ObservableObject {
                 if !outcome.conflicts.isEmpty {
                     let reasons = outcome.conflicts.map(\.message).joined(separator: " ")
                     messages.append("\(url.lastPathComponent) was saved but left off: \(reasons)")
+                }
+                if !outcome.seededDNS.isEmpty {
+                    dnsDirty = true
+                    messages.append("Connection DNS set to \(outcome.seededDNS.joined(separator: ", ")) from \(url.lastPathComponent). You can change it in the DNS settings.")
+                }
+                if !outcome.ignoredDNS.isEmpty {
+                    messages.append("\(url.lastPathComponent) also lists DNS \(outcome.ignoredDNS.joined(separator: ", ")), which is not used: DNS comes only from the connection's settings.")
                 }
             } catch {
                 messages.append("\(url.lastPathComponent): \(error.localizedDescription)")
@@ -397,7 +428,7 @@ final class AppController: ObservableObject {
         switch condition {
         case .ssidEquals, .ssidNotEquals:
             if observer.locationStatus == .notDetermined { observer.requestLocationPermission() }
-        case .publicIPInRange:
+        case .publicIPInRange, .publicIPChanges:
             break
         }
     }

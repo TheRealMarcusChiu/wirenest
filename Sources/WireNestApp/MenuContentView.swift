@@ -35,7 +35,7 @@ struct MenuBarIcon: View {
 
     var body: some View {
         Image(systemName: controller.overallHealth.symbol)
-            .accessibilityLabel("WireNest: \(controller.overallHealth.label)")
+            .accessibilityLabel("WireNest: \(controller.statusLabel)")
     }
 }
 
@@ -64,6 +64,11 @@ struct StatusBanners: View {
                 Button("Install or Update Helper…") { controller.installHelper() }
             }
         }
+        if let reason = controller.pauseReason {
+            Label("Paused: \(reason) It resumes on its own when allowed.", systemImage: "pause.circle")
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+        }
         ForEach([controller.connectionError, controller.dnsError, controller.notice].compactMap { $0 }, id: \.self) { message in
             Text(message)
                 .font(.caption)
@@ -91,7 +96,7 @@ struct MenuContentView: View {
                 HealthDot(health: controller.overallHealth)
                 Text("WireNest").font(.headline)
                 Spacer()
-                Text(controller.overallHealth.label).foregroundColor(.secondary)
+                Text(controller.statusLabel).foregroundColor(.secondary)
             }
 
             StatusBanners(controller: controller)
@@ -112,7 +117,7 @@ struct MenuContentView: View {
                     }
                 }
 
-                Toggle("Connected", isOn: Binding(
+                Toggle("On", isOn: Binding(
                     get: { controller.state.connectionOn },
                     set: { on in
                         if !on {
@@ -129,7 +134,7 @@ struct MenuContentView: View {
             if let profile = activeProfile {
                 Divider()
                 ForEach(profile.tunnels) { tunnel in
-                    TunnelMenuRow(controller: controller, tunnel: tunnel, isOn: controller.state.connectionOn)
+                    TunnelMenuRow(controller: controller, tunnel: tunnel, isOn: controller.state.connectionOn && controller.pauseReason == nil)
                 }
                 if profile.tunnels.isEmpty {
                     Text("This connection has no tunnels yet.").font(.caption).foregroundColor(.secondary)
@@ -197,6 +202,7 @@ private struct TunnelMenuRow: View {
 
     private var detail: String {
         if !tunnel.enabled { return "Off" }
+        if controller.pauseReason != nil { return "Paused" }
         if !isOn { return "Waiting for connection" }
         var parts = [health.label]
         if let text = view?.detail { parts.append(text) }

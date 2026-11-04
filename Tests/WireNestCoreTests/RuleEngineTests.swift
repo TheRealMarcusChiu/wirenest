@@ -152,6 +152,221 @@ final class RuleEngineTests: XCTestCase {
         XCTAssertEqual(state.activeProfileID, home)
     }
 
+    // MARK: mandatory eligibility of rule targets
+
+    func testIneligibleRuleTargetIsSkippedForTheNextEligibleRule() {
+        var state = makeState(ordered: [(.ssidNotEquals("Other"), away), (.ssidNotEquals("Other"), home)])
+        state.profiles[1].ssidEligibility = .onlyEquals("Elsewhere")
+        var engine = RuleEngine()
+        XCTAssertEqual(settled(&engine, &state, NetworkSnapshot(ssid: .known("Cafe")), at: t0), home)
+    }
+
+    func testRuleCannotSelectATargetThatIsIneligibleUnderUnknownSSID() {
+        var state = makeState(ordered: [(.publicIPInRange("203.0.113.0/24"), away)])
+        state.publicIPAutomationEnabled = true
+        state.profiles[1].ssidEligibility = .onlyNotEquals("Home")
+        var engine = RuleEngine()
+        XCTAssertNil(settled(&engine, &state, NetworkSnapshot(ssid: .unavailable("off"), publicIP: "203.0.113.9"), at: t0))
+    }
+
+    // MARK: public IP change trigger
+
+    private func net(_ ip: String?, ssid: String = "Net") -> NetworkSnapshot {
+        NetworkSnapshot(ssid: .known(ssid), publicIP: ip)
+    }
+
+    private func changeState(_ extra: [(RuleCondition, UUID)] = []) -> AppState {
+        var state = makeState(ordered: [(.publicIPChanges, away)] + extra)
+        state.publicIPAutomationEnabled = true
+        state.activeProfileID = home
+        state.connectionOn = true
+        return state
+    }
+
+    func testFirstStableIPIsABaselineNotAChange() {
+        var state = changeState()
+        var engine = RuleEngine()
+        XCTAssertNil(settled(&engine, &state, net("203.0.113.1"), at: t0))
+        XCTAssertNil(settled(&engine, &state, net("203.0.113.1"), at: t0.addingTimeInterval(100)))
+    }
+
+    func testStableChangeSelectsTargetExactlyOnce() {
+        var state = changeState()
+        var engine = RuleEngine()
+        _ = settled(&engine, &state, net("203.0.113.1"), at: t0)
+        XCTAssertEqual(settled(&engine, &state, net("198.51.100.1"), at: t0.addingTimeInterval(100)), away)
+
+        // The user then moves away by hand and the address stays put: the event must not fire again.
+        state.pinnedContext = nil
+        for offset in stride(from: 200.0, through: 800, by: 50) {
+            XCTAssertNil(engine.evaluate(state: &state, snapshot: net("198.51.100.1"), now: t0.addingTimeInterval(offset)))
+        }
+    }
+
+    func testChangeIsDisabledWithoutTheOptIn() {
+        var state = changeState()
+        state.publicIPAutomationEnabled = false
+        var engine = RuleEngine()
+        _ = settled(&engine, &state, net("203.0.113.1"), at: t0)
+        XCTAssertNil(settled(&engine, &state, net("198.51.100.1"), at: t0.addingTimeInterval(100)))
+    }
+
+    func testProbeFailureThenSameAddressIsNotAChange() {
+        var state = changeState()
+        var engine = RuleEngine()
+        _ = settled(&engine, &state, net("203.0.113.1"), at: t0)
+        XCTAssertNil(settled(&engine, &state, net(nil), at: t0.addingTimeInterval(100)))
+        XCTAssertNil(settled(&engine, &state, net("203.0.113.1"), at: t0.addingTimeInterval(200)))
+    }
+
+    func testProbeFailureThenDifferentAddressIsAChange() {
+        var state = changeState()
+        var engine = RuleEngine()
+        _ = settled(&engine, &state, net("203.0.113.1"), at: t0)
+        _ = settled(&engine, &state, net(nil), at: t0.addingTimeInterval(100))
+        XCTAssertEqual(settled(&engine, &state, net("198.51.100.1"), at: t0.addingTimeInterval(200)), away)
+    }
+
+    func testChangeThroughTheStabilizerFiresOnlyAfterConfirmation() {
+        var stabilizer = PublicIPStabilizer()
+        var state = changeState()
+        var engine = RuleEngine()
+        var now = t0
+        func step(_ observed: String?) -> UUID? {
+            now.addTimeInterval(engine.debounce)
+            return engine.evaluate(state: &state, snapshot: net(stabilizer.observe(observed)), now: now)
+        }
+        XCTAssertNil(step("203.0.113.1"))
+        XCTAssertNil(step("203.0.113.1"))
+        XCTAssertNil(step("198.51.100.1"), "one odd probe is not a change")
+        XCTAssertNil(step("203.0.113.1"))
+        XCTAssertNil(step("198.51.100.1"))
+        XCTAssertNil(step("198.51.100.1"), "confirmed now, and the debounce starts")
+        XCTAssertEqual(step("198.51.100.1"), away)
+    }
+
+    func testManualOffBlocksTheChangeAndDoesNotQueueIt() {
+        var state = changeState()
+        var engine = RuleEngine()
+        _ = settled(&engine, &state, net("203.0.113.1"), at: t0)
+        state.manualOff = true
+        state.connectionOn = false
+        XCTAssertNil(settled(&engine, &state, net("198.51.100.1"), at: t0.addingTimeInterval(100)))
+        state.manualOff = false
+        XCTAssertNil(settled(&engine, &state, net("198.51.100.1"), at: t0.addingTimeInterval(200)))
+    }
+
+    func testChangeDuringMinimumDwellStaysPendingAndThenFires() {
+        var state = changeState([(.ssidEquals("Net"), home)])
+        state.activeProfileID = away
+        var engine = RuleEngine()
+        XCTAssertEqual(settled(&engine, &state, net("203.0.113.1"), at: t0), home)
+        state.activeProfileID = home
+
+        let changed = net("198.51.100.1")
+        XCTAssertNil(engine.evaluate(state: &state, snapshot: changed, now: t0.addingTimeInterval(10)))
+        XCTAssertNil(engine.evaluate(state: &state, snapshot: changed, now: t0.addingTimeInterval(20)), "inside minimum dwell")
+        XCTAssertEqual(engine.evaluate(state: &state, snapshot: changed, now: t0.addingTimeInterval(engine.debounce + engine.minDwell)), away)
+    }
+
+    func testIneligibleTargetInvalidatesTheChangeSoItCannotFireLater() {
+        var state = changeState()
+        state.profiles[1].ssidEligibility = .onlyEquals("Other")
+        var engine = RuleEngine()
+        _ = settled(&engine, &state, net("203.0.113.1"), at: t0)
+        XCTAssertNil(settled(&engine, &state, net("198.51.100.1"), at: t0.addingTimeInterval(100)))
+        XCTAssertNil(settled(&engine, &state, net("198.51.100.1", ssid: "Other"), at: t0.addingTimeInterval(200)))
+    }
+
+    func testHigherPriorityRuleKeepingTheActiveConnectionConsumesTheChange() {
+        var state = makeState(ordered: [(.ssidEquals("Net"), home), (.publicIPChanges, away)])
+        state.publicIPAutomationEnabled = true
+        state.activeProfileID = home
+        state.connectionOn = true
+        var engine = RuleEngine()
+        _ = settled(&engine, &state, net("203.0.113.1"), at: t0)
+        XCTAssertNil(settled(&engine, &state, net("198.51.100.1"), at: t0.addingTimeInterval(100)))
+        XCTAssertNil(settled(&engine, &state, net("198.51.100.1", ssid: "Other"), at: t0.addingTimeInterval(200)), "no stale event")
+    }
+
+    func testChangeSelectionHoldsAgainstLowerRulesUntilTheNetworkChangesAgain() {
+        var state = changeState([(.ssidEquals("Net"), home)])
+        var engine = RuleEngine()
+        _ = settled(&engine, &state, net("203.0.113.1"), at: t0)
+        XCTAssertEqual(settled(&engine, &state, net("198.51.100.1"), at: t0.addingTimeInterval(100)), away)
+        XCTAssertNotNil(state.pinnedContext)
+        state.activeProfileID = away
+
+        XCTAssertNil(settled(&engine, &state, net("198.51.100.1"), at: t0.addingTimeInterval(500)), "no flip back on later polls")
+        XCTAssertEqual(state.activeProfileID, away)
+    }
+
+    func testOwnVPNSwitchWithSamePhysicalIPIsNotAChange() {
+        // The probe is bound to the physical interface, so switching connections leaves its answer unchanged.
+        var state = changeState()
+        var engine = RuleEngine()
+        _ = settled(&engine, &state, net("203.0.113.1"), at: t0)
+        state.activeProfileID = away
+        XCTAssertNil(settled(&engine, &state, net("203.0.113.1"), at: t0.addingTimeInterval(100)))
+        state.activeProfileID = home
+        XCTAssertNil(settled(&engine, &state, net("203.0.113.1"), at: t0.addingTimeInterval(200)))
+    }
+
+    // MARK: manual pins and unknown values
+
+    private func pinnedOnAway(at snapshot: NetworkSnapshot, extra: [(RuleCondition, UUID)]) -> AppState {
+        var state = makeState(ordered: extra)
+        state.publicIPAutomationEnabled = true
+        state.activeProfileID = away
+        state.connectionOn = true
+        state.pinnedContext = snapshot.contextKey(includingPublicIP: true)
+        return state
+    }
+
+    func testFailedProbeOrRecoveredSameAddressDoesNotReleaseAPin() {
+        var state = pinnedOnAway(at: net("203.0.113.1"), extra: [(.ssidEquals("Net"), home)])
+        var engine = RuleEngine()
+        XCTAssertNil(settled(&engine, &state, net("203.0.113.1"), at: t0))
+        XCTAssertNil(settled(&engine, &state, net(nil), at: t0.addingTimeInterval(100)))
+        XCTAssertNil(settled(&engine, &state, net("203.0.113.1"), at: t0.addingTimeInterval(200)))
+        XCTAssertNotNil(state.pinnedContext)
+    }
+
+    func testRealPublicIPChangeReleasesAPin() {
+        var state = pinnedOnAway(at: net("203.0.113.1"), extra: [(.ssidEquals("Net"), home)])
+        var engine = RuleEngine()
+        _ = settled(&engine, &state, net("203.0.113.1"), at: t0)
+        XCTAssertEqual(settled(&engine, &state, net("198.51.100.1"), at: t0.addingTimeInterval(100)), home)
+        XCTAssertNil(state.pinnedContext)
+    }
+
+    func testPinMadeBeforeTheFirstProbeIsReleasedByALaterRealChangeOnly() {
+        var state = pinnedOnAway(at: net(nil), extra: [(.ssidEquals("Net"), home)])
+        var engine = RuleEngine()
+        XCTAssertNil(settled(&engine, &state, net("203.0.113.1"), at: t0), "the first address is a baseline")
+        XCTAssertNotNil(state.pinnedContext)
+        XCTAssertEqual(settled(&engine, &state, net("198.51.100.1"), at: t0.addingTimeInterval(100)), home)
+    }
+
+    func testPinSurvivesAChangeSeenWhileIgnoringPublicIP() {
+        var state = pinnedOnAway(at: net("203.0.113.1"), extra: [(.ssidEquals("Net"), home)])
+        state.publicIPAutomationEnabled = false
+        var engine = RuleEngine()
+        XCTAssertNil(settled(&engine, &state, net("198.51.100.1"), at: t0))
+        XCTAssertNotNil(state.pinnedContext)
+    }
+
+    func testManualConnectDropsAChangeSeenBeforeIt() {
+        var state = changeState()
+        var engine = RuleEngine()
+        _ = settled(&engine, &state, net("203.0.113.1"), at: t0)
+        _ = engine.evaluate(state: &state, snapshot: net("198.51.100.1"), now: t0.addingTimeInterval(100))
+        state.pinnedContext = net("198.51.100.1").contextKey(includingPublicIP: true)
+        XCTAssertNil(settled(&engine, &state, net("198.51.100.1"), at: t0.addingTimeInterval(110)))
+        state.pinnedContext = nil
+        XCTAssertNil(settled(&engine, &state, net("198.51.100.1"), at: t0.addingTimeInterval(200)))
+    }
+
     func testPublicIPStabilizerRequiresTwoEqualProbes() {
         var stabilizer = PublicIPStabilizer()
         XCTAssertNil(stabilizer.observe("203.0.113.1"))

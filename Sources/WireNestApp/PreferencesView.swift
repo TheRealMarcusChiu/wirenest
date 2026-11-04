@@ -84,6 +84,15 @@ private struct ProfileDetail: View {
     @State private var primaryDNS: String
     @State private var secondaryDNS: String
     @State private var editing: SavedTunnel?
+    @State private var eligibilityMode: EligibilityMode
+    @State private var eligibilitySSID: String
+
+    private enum EligibilityMode: String, CaseIterable, Identifiable {
+        case anywhere = "On any network"
+        case onlyEquals = "Only on Wi-Fi named"
+        case onlyNotEquals = "Only on Wi-Fi not named"
+        var id: String { rawValue }
+    }
 
     init(controller: AppController, profile: ConnectionProfile) {
         self.controller = controller
@@ -91,6 +100,25 @@ private struct ProfileDetail: View {
         _name = State(initialValue: profile.name)
         _primaryDNS = State(initialValue: profile.primaryDNS)
         _secondaryDNS = State(initialValue: profile.secondaryDNS)
+        switch profile.ssidEligibility {
+        case .onlyEquals(let ssid)?:
+            _eligibilityMode = State(initialValue: .onlyEquals)
+            _eligibilitySSID = State(initialValue: ssid)
+        case .onlyNotEquals(let ssid)?:
+            _eligibilityMode = State(initialValue: .onlyNotEquals)
+            _eligibilitySSID = State(initialValue: ssid)
+        case nil:
+            _eligibilityMode = State(initialValue: .anywhere)
+            _eligibilitySSID = State(initialValue: "")
+        }
+    }
+
+    private func applyEligibility() {
+        switch eligibilityMode {
+        case .anywhere: controller.setSSIDEligibility(profile.id, nil)
+        case .onlyEquals: controller.setSSIDEligibility(profile.id, .onlyEquals(eligibilitySSID))
+        case .onlyNotEquals: controller.setSSIDEligibility(profile.id, .onlyNotEquals(eligibilitySSID))
+        }
     }
 
     var body: some View {
@@ -107,7 +135,29 @@ private struct ProfileDetail: View {
                             controller.setDNS(profile.id, primary: primaryDNS, secondary: secondaryDNS)
                         }
                     }
-                    Text("Applied while connected and restored after the last tunnel stops. macOS may use either server, so the secondary is not a guaranteed failover.")
+                    Text("Applied while connected and restored after the last tunnel stops. macOS may use either server, so the secondary is not a guaranteed failover. DNS lines in tunnel files are not applied: this connection's settings are the only DNS used. The first import fills these fields if they are empty.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(4)
+            }
+            // An import can fill these in while this view is open.
+            .onChange(of: profile.primaryDNS) { primaryDNS = $0 }
+            .onChange(of: profile.secondaryDNS) { secondaryDNS = $0 }
+
+            GroupBox("Where this connection may run") {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Picker("Run", selection: $eligibilityMode) {
+                            ForEach(EligibilityMode.allCases) { Text($0.rawValue).tag($0) }
+                        }
+                        if eligibilityMode != .anywhere {
+                            TextField("Network name", text: $eligibilitySSID)
+                        }
+                        Button("Apply") { applyEligibility() }
+                    }
+                    Text("A limited connection stops whenever its condition is not met and resumes when it is met again, unless you turned it off. If the Wi-Fi name is unavailable (no Location permission, Wi-Fi off, Ethernet only), both limits count as not met.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -137,7 +187,7 @@ private struct ProfileDetail: View {
                     Button("Delete") { controller.removeTunnel(tunnel.id) }
                 }
             }
-            Text("Tunnels with overlapping routes cannot be on together. One tunnel may own the default route per IP family; other tunnels may still use narrower routes, and their own traffic then travels through the default tunnel.")
+            Text("Tunnels with overlapping routes cannot be on together. A tunnel using the default route (0.0.0.0/0 or ::/0) needs that whole IP family to itself, including other tunnels' addresses and endpoints.")
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -149,6 +199,7 @@ private struct ProfileDetail: View {
 
     private func stateLine(_ tunnel: SavedTunnel) -> String {
         guard controller.state.connectionOn, controller.state.activeProfileID == profile.id, tunnel.enabled else { return "" }
+        if controller.pauseReason != nil { return "Paused" }
         guard let view = controller.views[tunnel.id] else { return TunnelHealth.connecting.label }
         return view.lastError ?? [view.state.label, view.detail].compactMap { $0 }.joined(separator: " · ")
     }
@@ -213,6 +264,7 @@ private struct RulesTab: View {
         case ssidEquals = "Wi-Fi is"
         case ssidNotEquals = "Wi-Fi is not"
         case publicIP = "Public IP is in"
+        case publicIPChanges = "Public IP changes"
         var id: String { rawValue }
     }
 
@@ -223,7 +275,7 @@ private struct RulesTab: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("The first matching rule picks the connection, after the match has held for a few seconds. With no match, nothing changes. Disconnecting by hand stops rules until you connect again; choosing a connection by hand holds it until the network changes.")
+            Text("The first matching rule picks the connection, after the match has held for a few seconds, and skips a connection not allowed on this network. With no match, nothing changes. Disconnecting by hand stops rules until you connect again; choosing a connection by hand holds it until the network changes.")
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -251,7 +303,9 @@ private struct RulesTab: View {
                     ForEach(Kind.allCases) { Text($0.rawValue).tag($0) }
                 }
                 .frame(width: 190)
-                TextField(valuePrompt, text: $value)
+                if kind != .publicIPChanges {
+                    TextField(valuePrompt, text: $value)
+                }
                 Picker("use", selection: $profileID) {
                     Text("Choose…").tag(UUID?.none)
                     ForEach(controller.state.profiles) { Text($0.name).tag(UUID?.some($0.id)) }
@@ -289,7 +343,7 @@ private struct RulesTab: View {
                             .onSubmit { controller.setPublicIPCheckURL(checkURL) }
                         Text(controller.publicIP ?? "Unknown").foregroundColor(.secondary)
                     }
-                    Text("When on, WireNest contacts this third-party address over your Wi-Fi or Ethernet connection, bypassing tunnels, about every 5 minutes and after network changes. It learns your public IP; no tunnel information is sent. A new address must be seen twice before rules act on it.")
+                    Text("Public IP rules do nothing until this is on. When on, WireNest contacts this third-party address over your Wi-Fi or Ethernet connection, bypassing tunnels, about every 5 minutes and after network changes. It learns your public IP; no tunnel information is sent. A new address must be seen twice before rules act on it. The first address seen after launch is a starting point, not a change.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -306,8 +360,10 @@ private struct RulesTab: View {
     }
 
     private var canAdd: Bool {
+        guard profileID != nil else { return false }
+        if kind == .publicIPChanges { return true }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard profileID != nil, !trimmed.isEmpty else { return false }
+        guard !trimmed.isEmpty else { return false }
         return kind != .publicIP || CIDR(trimmed) != nil
     }
 
@@ -318,6 +374,7 @@ private struct RulesTab: View {
         case .ssidEquals: controller.addRule(.ssidEquals(trimmed), profileID: profileID)
         case .ssidNotEquals: controller.addRule(.ssidNotEquals(trimmed), profileID: profileID)
         case .publicIP: controller.addRule(.publicIPInRange(trimmed), profileID: profileID)
+        case .publicIPChanges: controller.addRule(.publicIPChanges, profileID: profileID)
         }
         value = ""
     }
@@ -328,6 +385,7 @@ private struct RulesTab: View {
         case .ssidEquals(let name): return "Wi-Fi is “\(name)” → \(target)"
         case .ssidNotEquals(let name): return "Wi-Fi is not “\(name)” → \(target)"
         case .publicIPInRange(let range): return "Public IP is in \(range) → \(target)"
+        case .publicIPChanges: return "Public IP changes → \(target)"
         }
     }
 

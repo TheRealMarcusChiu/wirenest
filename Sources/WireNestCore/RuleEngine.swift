@@ -19,18 +19,31 @@ public struct NetworkSnapshot: Equatable {
         self.publicIP = publicIP
     }
 
-    /// Identifies the network for manual pins. Nil means “no information”, which never releases a pin.
+    /// Identifies the network for manual pins. Nil means “no information”, which never sets a pin.
     public func contextKey(includingPublicIP: Bool) -> String? {
         let ip = includingPublicIP ? publicIP : nil
         if ssid.name == nil, ip == nil { return nil }
         return "ssid:\(ssid.name ?? "?")|ip:\(ip ?? "?")"
     }
+
+    /// Only a known value that differs from a known pinned value counts: a failed probe or a
+    /// missing SSID is not a network change.
+    func contradicts(pin: String, includingPublicIP: Bool) -> Bool {
+        guard let split = pin.range(of: "|ip:", options: .backwards) else { return true }
+        let pinnedSSID = pin[..<split.lowerBound].dropFirst("ssid:".count)
+        let pinnedIP = pin[split.upperBound...]
+        if let name = ssid.name, pinnedSSID != "?", name != pinnedSSID { return true }
+        if includingPublicIP, let publicIP, pinnedIP != "?", publicIP != pinnedIP { return true }
+        return false
+    }
 }
 
 extension RuleCondition {
     /// Unknown values never match: an unavailable SSID must not satisfy “not this SSID”.
-    func matches(_ snapshot: NetworkSnapshot, publicIPAllowed: Bool) -> Bool {
+    func matches(_ snapshot: NetworkSnapshot, publicIPAllowed: Bool, publicIPChanged: Bool) -> Bool {
         switch self {
+        case .publicIPChanges:
+            return publicIPChanged
         case .ssidEquals(let name):
             return snapshot.ssid.name == name
         case .ssidNotEquals(let name):
@@ -51,30 +64,44 @@ public struct RuleEngine {
 
     private var pending: (profile: UUID, since: Date)?
     private var lastSwitch: Date?
+    /// Last known stable public IP this run. Deliberately kept through failed probes.
+    private var publicIPBaseline: String?
+    /// A real change waiting out debounce and dwell. Rules that win over it, or any guard, drop it.
+    private var publicIPChangePending = false
 
     public init() {}
 
     /// Returns the profile that should be connected now, or nil to keep the current state.
     /// A rule never disconnects: with no match the current connection stays as it is.
     public mutating func evaluate(state: inout AppState, snapshot: NetworkSnapshot, now: Date) -> UUID? {
+        let publicIPAllowed = state.publicIPAutomationEnabled
+        let changedNow = observePublicIP(snapshot.publicIP, enabled: publicIPAllowed)
+
         guard !state.manualOff else {
             pending = nil
+            publicIPChangePending = false
             return nil
         }
         if let pin = state.pinnedContext {
-            guard let key = snapshot.contextKey(includingPublicIP: state.publicIPAutomationEnabled), key != pin else {
+            guard changedNow || snapshot.contradicts(pin: pin, includingPublicIP: publicIPAllowed) else {
                 pending = nil
+                publicIPChangePending = false
                 return nil
             }
             state.pinnedContext = nil
         }
 
-        let candidate = state.rules.first { rule in
-            rule.enabled && state.profile(rule.profileID) != nil
-                && rule.condition.matches(snapshot, publicIPAllowed: state.publicIPAutomationEnabled)
-        }?.profileID
-        guard let candidate, !(candidate == state.activeProfileID && state.connectionOn) else {
+        let changed = publicIPChangePending
+        let winner = state.rules.first { rule in
+            guard rule.enabled, let target = state.profile(rule.profileID), target.ineligibilityReason(snapshot.ssid) == nil else { return false }
+            return rule.condition.matches(snapshot, publicIPAllowed: publicIPAllowed, publicIPChanged: changed)
+        }
+        let firesOnChange = winner?.condition == .publicIPChanges
+        if !firesOnChange { publicIPChangePending = false }
+
+        guard let candidate = winner?.profileID, !(candidate == state.activeProfileID && state.connectionOn) else {
             pending = nil
+            publicIPChangePending = false
             return nil
         }
 
@@ -86,7 +113,26 @@ public struct RuleEngine {
         if let lastSwitch, now.timeIntervalSince(lastSwitch) < minDwell { return nil }
         self.pending = nil
         lastSwitch = now
+        if firesOnChange {
+            publicIPChangePending = false
+            // A one-shot event has nothing to hold it afterwards, so lower rules would otherwise flip straight back.
+            state.pinnedContext = snapshot.contextKey(includingPublicIP: true)
+        }
         return candidate
+    }
+
+    /// True only for a known address replacing a different known one: the first address is just a baseline.
+    private mutating func observePublicIP(_ ip: String?, enabled: Bool) -> Bool {
+        guard enabled else {
+            publicIPBaseline = nil
+            publicIPChangePending = false
+            return false
+        }
+        guard let ip, ip != publicIPBaseline else { return false }
+        defer { publicIPBaseline = ip }
+        guard publicIPBaseline != nil else { return false }
+        publicIPChangePending = true
+        return true
     }
 }
 
