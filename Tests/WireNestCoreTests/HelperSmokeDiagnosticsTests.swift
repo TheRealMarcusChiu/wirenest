@@ -79,6 +79,21 @@ final class HelperSmokeDiagnosticsTests: XCTestCase {
         XCTAssertTrue(line.contains("attempts=2"))
     }
 
+    func testFullCheckpointPhasesAndIdentitySurviveBesideASuccessfulSibling() {
+        let timedOut = attempt(progress(.preparing, timedOut: true))
+        let answered = attempt(progress(.endOfStream), response: "HTTP/1.1 200 OK\r\n\r\n\(token)")
+
+        for phase in ["order-first", "order-both", "order-survivor"] {
+            let a = formatProbeDiagnostic(tunnel: "A", phase: phase, attempts: Array(repeating: timedOut, count: 4))
+            let b = formatProbeDiagnostic(tunnel: "B", phase: phase, attempts: [answered])
+            XCTAssertTrue(a.hasPrefix("probe tunnel=A phase=\(phase) matched=false attempts=4 4x[stage=preparing"), a)
+            XCTAssertTrue(a.contains("timedOut=true bytes=0 header=false"), a)
+            XCTAssertTrue(b.hasPrefix("probe tunnel=B phase=\(phase) matched=true attempts=1 1x[stage=endOfStream"), b)
+            XCTAssertTrue(b.contains("header=true status200=true body=true"), b)
+            XCTAssertFalse(a.contains(token) || b.contains(token))
+        }
+    }
+
     func testReportsErrorsOnlyAsACategoryAndCode() {
         let line = formatProbeDiagnostic(
             tunnel: "A", phase: "initial",

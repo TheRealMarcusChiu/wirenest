@@ -260,7 +260,7 @@ extension HelperSmoke {
 
         let firstInterface = try await bringUp(first, client: client)
         try await verifyRoutes(fullInterface: first.id == full.id ? firstInterface : nil, splitInterface: first.id == split.id ? firstInterface : nil, full: full)
-        try await checkpoint([first], client: client)
+        try await checkpoint([first], fullID: full.id, phase: "order-first", client: client)
         print("First tunnel carries traffic.")
 
         let secondInterface = try await bringUp(second, client: client)
@@ -269,7 +269,7 @@ extension HelperSmoke {
         let fullInterface = first.id == full.id ? firstInterface : secondInterface
         let splitInterface = first.id == split.id ? firstInterface : secondInterface
         try await verifyRoutes(fullInterface: fullInterface, splitInterface: splitInterface, full: full)
-        try await checkpoint([full, split], client: client)
+        try await checkpoint([full, split], fullID: full.id, phase: "order-both", client: client)
         print("Both tunnels carry traffic on distinct interfaces.")
 
         // The tunnel started second stops first, leaving the first one as the survivor in either order.
@@ -280,7 +280,7 @@ extension HelperSmoke {
         guard try await liveInterface(first, client: client) == firstInterface else { throw Failure("Stopping the second tunnel changed the survivor's interface.") }
         try await verifyRoutes(fullInterface: first.id == full.id ? firstInterface : nil, splitInterface: first.id == split.id ? firstInterface : nil, full: full)
         try verifyGone(second.id == full.id ? fullInterface : nil, splitInterface: second.id == split.id ? splitInterface : nil)
-        try await checkpoint([first], client: client)
+        try await checkpoint([first], fullID: full.id, phase: "order-survivor", client: client)
         print("The survivor kept its interface and carries traffic.")
 
         let ended = try await client.send(.down(tunnelID: first.id))
@@ -340,26 +340,43 @@ extension HelperSmoke {
         }
     }
 
+    /// Stops at the first match, so the last attempt says whether the probe succeeded.
+    private static func probeFullRoute(_ tunnel: HelperSmokeManifest.Tunnel) async -> [SmokeProbeAttempt] {
+        var attempts: [SmokeProbeAttempt] = []
+        for _ in 0..<fullRouteProbeAttempts {
+            let attempt = await probeAttempt(tunnel, timeout: probeTimeout)
+            attempts.append(attempt)
+            if attempt.matches { break }
+        }
+        return attempts
+    }
+
     /// Fresh ordinary connections with no interface or address binding, so only real routing can deliver them. The
     /// baseline is taken here, so earlier traffic cannot satisfy this checkpoint.
-    private static func checkpoint(_ tunnels: [HelperSmokeManifest.Tunnel], client: HelperClient) async throws {
+    private static func checkpoint(_ tunnels: [HelperSmokeManifest.Tunnel], fullID: UUID, phase: String, client: HelperClient) async throws {
         var baselines: [PeerStats] = []
         for tunnel in tunnels { baselines.append(try await peer(of: tunnel, client: client)) }
 
-        let answers = await withTaskGroup(of: Bool.self, returning: [Bool].self) { group in
-            for tunnel in tunnels {
+        let attempts = await withTaskGroup(of: (Int, [SmokeProbeAttempt]).self, returning: [[SmokeProbeAttempt]].self) { group in
+            for (index, tunnel) in tunnels.enumerated() {
                 group.addTask {
-                    for _ in 0..<fullRouteProbeAttempts {
-                        if await rawProbe(tunnel, timeout: probeTimeout) { return true }
-                    }
-                    return false
+                    let tried = await probeFullRoute(tunnel)
+                    return (index, tried)
                 }
             }
-            var results: [Bool] = []
-            for await answer in group { results.append(answer) }
+            // By position, as tunnels finish in any order.
+            var results = [[SmokeProbeAttempt]](repeating: [], count: tunnels.count)
+            for await (index, tried) in group { results[index] = tried }
             return results
         }
-        guard answers.allSatisfy({ $0 }) else { throw Failure("A tunnel did not return its exact token.") }
+        guard attempts.allSatisfy({ $0.last?.matches == true }) else {
+            // Failure-only, and only what was already collected: a status call here could trigger the route guard and change the state.
+            for (tunnel, tried) in zip(tunnels, attempts) {
+                let line = formatProbeDiagnostic(tunnel: tunnel.id == fullID ? "A" : "B", phase: phase, attempts: tried)
+                FileHandle.standardError.write(Data("FULL_ROUTE_SMOKE_DIAGNOSTIC: \(redactSecrets(line))\n".utf8))
+            }
+            throw Failure("A tunnel did not return its exact token.")
+        }
 
         for (tunnel, baseline) in zip(tunnels, baselines) {
             let after = try await peer(of: tunnel, client: client)
