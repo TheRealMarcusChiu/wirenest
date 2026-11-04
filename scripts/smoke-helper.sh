@@ -799,6 +799,28 @@ stop_peers() {
   return "$status"
 }
 
+# Failure only, and before the peers are stopped, because after that every peer looks the same.
+report_peer_states() {
+  local pid status label=a
+  for pid in $peer_pids; do
+    case $(peer_state "$pid") in
+      alive) echo "peer $label: alive" >&2 ;;
+      unknown) echo "peer $label: state unknown" >&2 ;;
+      *)
+        # Not running as our child, so this returns at once. 127: this shell no longer knows the status.
+        status=0
+        wait "$pid" 2>/dev/null || status=$?
+        if [[ $status -eq 127 ]]; then
+          echo "peer $label: exited, status unknown" >&2
+        else
+          echo "peer $label: exited with status $status" >&2
+        fi
+        ;;
+    esac
+    label=b
+  done
+}
+
 self_test_shell() {
   local child orphan first name
   # start_child TRAP: a real child of this shell, once its signal handling is in place.
@@ -865,7 +887,27 @@ self_test_shell() {
   if stop_peers 2>/dev/null; then die "self-test: stop_peers hid a failure"; fi
   [[ $(peer_state "$first") == gone ]] || die "self-test: one failure skipped the other peer"
   end_child
+
+  # Real children: one already exited with a known status, one still running.
+  sh -c 'exit 7' </dev/null >/dev/null 2>&1 &
+  first=$!
+  peer_exit_wait "$first" || die "self-test: child did not exit"
+  start_child 'trap "" TERM'
+  peer_pids="$first $child"
+  report_peer_states 2>"$tmp/report"
+  [[ $(cat "$tmp/report") == "peer a: exited with status 7"$'\n'"peer b: alive" ]] ||
+    die "self-test: wrong peer report: $(cat "$tmp/report")"
+  [[ $(peer_state "$child") == alive ]] || die "self-test: the report disturbed a running peer"
+  stop_peer "$first" || die "self-test: the report broke stopping an exited peer"
+  # A failing ps must not reach the wait, which would block on the running child.
+  ps() { return 2; }
+  report_peer_states 2>"$tmp/report"
+  unset -f ps
+  [[ $(cat "$tmp/report") == *"peer b: state unknown" ]] || die "self-test: wrong report without ps: $(cat "$tmp/report")"
+  end_child
   peer_pids=""
+  report_peer_states 2>"$tmp/report"
+  [[ ! -s $tmp/report ]] || die "self-test: reported peers that were never started"
   peer_stop_ticks=50
 
   # Fixture captures, with the system commands replaced by functions.
@@ -973,6 +1015,9 @@ install_attempted=0
 cleanup() {
   local rc=$? waited=0 peers_stopped=1
   trap - EXIT INT TERM
+  if [[ $rc -ne 0 ]]; then
+    report_peer_states || true
+  fi
   if [[ $install_attempted -eq 1 ]]; then
     sudo -n "$helper" --uninstall || {
       echo "error: helper uninstall failed" >&2
