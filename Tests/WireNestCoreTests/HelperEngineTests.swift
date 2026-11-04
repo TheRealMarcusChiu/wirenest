@@ -1,0 +1,366 @@
+import XCTest
+@testable import WireNestCore
+
+/// Stands in for the real binaries only at the subprocess edge; everything above it is production code.
+final class FakeCommands: CommandRunning {
+    var calls: [(executable: String, args: [String])] = []
+    var failUp = false
+    var failDown = false
+    var dns: [String: [String]] = ["Wi-Fi": ["192.168.1.1"], "Ethernet": []]
+    var failSetDNS = false
+    var disabledServices: [String] = []
+    var nextUtun = 7
+    let paths: HelperPaths
+
+    init(paths: HelperPaths) { self.paths = paths }
+
+    func run(_ executable: String, _ args: [String], timeout: TimeInterval, readyMarker: String?) -> CommandResult {
+        calls.append((executable, args))
+        if executable == paths.bash {
+            let action = args[1], conf = args[2]
+            let name = URL(fileURLWithPath: conf).deletingPathExtension().lastPathComponent
+            let nameFile = paths.wireguardRunDir.appendingPathComponent("\(name).name")
+            if action == "up" {
+                if failUp { return CommandResult(status: 1, output: "wg setconf failed for \(testKey(1))") }
+                try? FileManager.default.createDirectory(at: paths.wireguardRunDir, withIntermediateDirectories: true)
+                try? "utun\(nextUtun)\n".write(to: nameFile, atomically: true, encoding: .utf8)
+                nextUtun += 1
+                return CommandResult(status: 0, output: "[+] Backgrounding route monitor")
+            }
+            if failDown { return CommandResult(status: 1, output: "cannot remove") }
+            try? FileManager.default.removeItem(at: nameFile)
+            return CommandResult(status: 0, output: "")
+        }
+        if executable == paths.wg {
+            switch args.last {
+            case "latest-handshakes": return CommandResult(status: 0, output: "\(testKey(2))\t1700000000\n")
+            case "transfer": return CommandResult(status: 0, output: "\(testKey(2))\t11\t22\n")
+            default: return CommandResult(status: 1, output: "")
+            }
+        }
+        if executable == "/usr/sbin/networksetup" {
+            switch args[0] {
+            case "-listallnetworkservices":
+                let enabled = dns.keys.sorted().joined(separator: "\n")
+                let disabled = disabledServices.map { "*" + $0 }.joined(separator: "\n")
+                return CommandResult(status: 0, output: "An asterisk (*) denotes that a network service is disabled.\n\(enabled)\n\(disabled)\n")
+            case "-getdnsservers":
+                let servers = dns[args[1]] ?? []
+                let text = servers.isEmpty ? "There aren't any DNS Servers set on \(args[1]).\n" : servers.joined(separator: "\n") + "\n"
+                return CommandResult(status: 0, output: text)
+            case "-setdnsservers":
+                if failSetDNS { return CommandResult(status: 1, output: "nope") }
+                dns[args[1]] = args[2] == "Empty" ? [] : Array(args[2...])
+                return CommandResult(status: 0, output: "")
+            default: break
+            }
+        }
+        return CommandResult(status: 127, output: "unexpected \(executable)")
+    }
+
+    var flatArgv: String { calls.map { ([$0.executable] + $0.args).joined(separator: " ") }.joined(separator: "\n") }
+    var quickCalls: [[String]] { calls.filter { $0.executable == paths.bash }.map { $0.args } }
+}
+
+final class HelperEngineTests: XCTestCase {
+    private var root: URL!
+    private var paths: HelperPaths!
+    private var commands: FakeCommands!
+    private var engine: HelperEngine!
+
+    override func setUpWithError() throws {
+        root = try tempDirectory()
+        paths = HelperPaths(
+            runtimeDir: root.appendingPathComponent("run"),
+            wireguardRunDir: root.appendingPathComponent("wg"),
+            toolsDir: root.appendingPathComponent("tools"),
+            durableDir: root.appendingPathComponent("durable")
+        )
+        commands = FakeCommands(paths: paths)
+        engine = try HelperEngine(paths: paths, runner: commands)
+    }
+
+    private func conf(_ n: Int, allowed: String? = nil, dns: String? = nil) -> String {
+        confText(address: "10.\(n).0.2/32", dns: dns, allowedIPs: allowed ?? "10.\(n).0.0/24")
+    }
+
+    private func ok(_ request: HelperRequest, file: StaticString = #filePath, line: UInt = #line) -> HelperResponse {
+        let response = engine.handle(request)
+        XCTAssertNil(response.error, file: file, line: line)
+        return response
+    }
+
+    func testUpWritesPrivateSanitisedConfAndKeepsKeyOutOfArgv() throws {
+        let id = UUID()
+        _ = ok(.up(tunnelID: id, config: conf(1, dns: "1.1.1.1")))
+        let call = try XCTUnwrap(commands.quickCalls.first)
+        XCTAssertEqual(call[0], paths.toolsDir.appendingPathComponent("wg-quick").path)
+        XCTAssertEqual(call[1], "up")
+        let confPath = call[2]
+        XCTAssertEqual(URL(fileURLWithPath: confPath).lastPathComponent, "wn0.conf")
+        let text = try String(contentsOfFile: confPath, encoding: .utf8)
+        XCTAssertFalse(text.lowercased().contains("dns"))
+        XCTAssertTrue(text.contains(testKey(1)), "wg-quick reads the key from this root-only file")
+        let mode = (try FileManager.default.attributesOfItem(atPath: confPath)[.posixPermissions] as! NSNumber).intValue
+        XCTAssertEqual(mode, 0o600)
+        XCTAssertFalse(commands.flatArgv.contains(testKey(1)))
+    }
+
+    func testRevalidatesAtPrivilegedBoundary() {
+        let unsafe = confText(extraInterface: "PostUp = curl evil | sh")
+        let response = engine.handle(.up(tunnelID: UUID(), config: unsafe))
+        XCTAssertNotNil(response.error)
+        XCTAssertTrue(commands.calls.isEmpty, "rejected before any subprocess")
+    }
+
+    func testRejectsConflictWithRunningTunnelAtPrivilegedBoundary() {
+        _ = ok(.up(tunnelID: UUID(), config: conf(1, allowed: "10.0.0.0/8")))
+        let before = commands.quickCalls.count
+        let response = engine.handle(.up(tunnelID: UUID(), config: conf(2, allowed: "10.9.0.0/16")))
+        XCTAssertNotNil(response.error)
+        XCTAssertEqual(commands.quickCalls.count, before)
+    }
+
+    func testTwoDisjointTunnelsGetDistinctInterfacesAndStatus() throws {
+        let a = UUID(), b = UUID()
+        _ = ok(.up(tunnelID: a, config: conf(1)))
+        _ = ok(.up(tunnelID: b, config: conf(2)))
+        let status = try XCTUnwrap(ok(.status).status)
+        XCTAssertEqual(Set(status.tunnels.map(\.interface)), ["utun7", "utun8"])
+        XCTAssertEqual(status.protocolVersion, HelperConstants.protocolVersion)
+        let tunnel = try XCTUnwrap(status.tunnels.first { $0.tunnelID == a })
+        XCTAssertTrue(tunnel.alive)
+        XCTAssertEqual(tunnel.peers.first?.rxBytes, 11)
+        XCTAssertEqual(tunnel.peers.first?.txBytes, 22)
+        XCTAssertEqual(tunnel.peers.first?.latestHandshake, Date(timeIntervalSince1970: 1_700_000_000))
+        XCTAssertEqual(tunnel.fingerprint, try WireGuardConfig.parse(conf(1)).fingerprint)
+    }
+
+    func testStatusDoesNotRequestAnythingExposingPrivateKeys() {
+        _ = ok(.up(tunnelID: UUID(), config: conf(1)))
+        _ = ok(.status)
+        let wgCalls = commands.calls.filter { $0.executable == paths.wg }.map { $0.args }
+        XCTAssertFalse(wgCalls.isEmpty)
+        XCTAssertFalse(wgCalls.contains { $0.contains("dump") || $0.contains("private-key") })
+    }
+
+    func testFreedInterfaceSlotIsReused() throws {
+        let a = UUID()
+        _ = ok(.up(tunnelID: a, config: conf(1)))
+        _ = ok(.down(tunnelID: a))
+        _ = ok(.up(tunnelID: UUID(), config: conf(2)))
+        XCTAssertEqual(URL(fileURLWithPath: commands.quickCalls.last![2]).lastPathComponent, "wn0.conf")
+    }
+
+    func testFailedUpCleansConfAndRedactsKeysFromError() throws {
+        commands.failUp = true
+        let response = engine.handle(.up(tunnelID: UUID(), config: conf(1)))
+        let error = try XCTUnwrap(response.error)
+        XCTAssertFalse(error.contains(testKey(1)))
+        XCTAssertTrue(error.contains("<redacted>"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.runtimeDir.appendingPathComponent("wn0.conf").path))
+        XCTAssertEqual(ok(.status).status?.tunnels.count, 0)
+    }
+
+    func testDownRemovesKeyFile() throws {
+        let id = UUID()
+        _ = ok(.up(tunnelID: id, config: conf(1)))
+        let path = paths.runtimeDir.appendingPathComponent("wn0.conf").path
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+        _ = ok(.down(tunnelID: id))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+    }
+
+    func testDownOfUnknownTunnelIsNoop() {
+        _ = ok(.down(tunnelID: UUID()))
+        XCTAssertTrue(commands.quickCalls.isEmpty)
+    }
+
+    func testFailedDownOfLiveInterfaceReportsAndKeepsTracking() {
+        let id = UUID()
+        _ = ok(.up(tunnelID: id, config: conf(1)))
+        commands.failDown = true
+        XCTAssertNotNil(engine.handle(.down(tunnelID: id)).error)
+        XCTAssertEqual(ok(.status).status?.tunnels.count, 1)
+    }
+
+    // MARK: DNS
+
+    func testDNSSnapshotAppliedThenRestoredAfterFinalDown() {
+        let a = UUID(), b = UUID()
+        _ = ok(.up(tunnelID: a, config: conf(1)))
+        _ = ok(.up(tunnelID: b, config: conf(2)))
+        _ = ok(.setDNS(primary: "9.9.9.9", secondary: "149.112.112.112"))
+        XCTAssertEqual(commands.dns["Wi-Fi"], ["9.9.9.9", "149.112.112.112"])
+        XCTAssertEqual(commands.dns["Ethernet"], ["9.9.9.9", "149.112.112.112"])
+
+        _ = ok(.down(tunnelID: a))
+        XCTAssertEqual(commands.dns["Wi-Fi"], ["9.9.9.9", "149.112.112.112"], "another tunnel is still up")
+        _ = ok(.down(tunnelID: b))
+        XCTAssertEqual(commands.dns["Wi-Fi"], ["192.168.1.1"])
+        XCTAssertEqual(commands.dns["Ethernet"], [])
+    }
+
+    func testEmptyPrimaryLeavesSystemDNSUntouched() {
+        _ = ok(.up(tunnelID: UUID(), config: conf(1, dns: "8.8.8.8")))
+        _ = ok(.setDNS(primary: "", secondary: ""))
+        XCTAssertEqual(commands.dns["Wi-Fi"], ["192.168.1.1"])
+        XCTAssertFalse(commands.calls.contains { $0.args.first == "-setdnsservers" })
+    }
+
+    func testClearingPrimaryRestoresOriginals() {
+        _ = ok(.up(tunnelID: UUID(), config: conf(1)))
+        _ = ok(.setDNS(primary: "9.9.9.9", secondary: ""))
+        _ = ok(.setDNS(primary: "", secondary: ""))
+        XCTAssertEqual(commands.dns["Wi-Fi"], ["192.168.1.1"])
+    }
+
+    func testReapplyIsIdempotentAndDoesNotResnapshotOurOwnValues() {
+        _ = ok(.up(tunnelID: UUID(), config: conf(1)))
+        _ = ok(.setDNS(primary: "9.9.9.9", secondary: ""))
+        let setCount = commands.calls.filter { $0.args.first == "-setdnsservers" }.count
+        _ = ok(.setDNS(primary: "9.9.9.9", secondary: ""))
+        XCTAssertEqual(commands.calls.filter { $0.args.first == "-setdnsservers" }.count, setCount)
+        _ = ok(.setDNS(primary: "", secondary: ""))
+        XCTAssertEqual(commands.dns["Wi-Fi"], ["192.168.1.1"])
+    }
+
+    func testNewServiceIsSnapshottedOnReapply() {
+        _ = ok(.up(tunnelID: UUID(), config: conf(1)))
+        _ = ok(.setDNS(primary: "9.9.9.9", secondary: ""))
+        commands.dns["USB LAN"] = ["10.0.0.53"]
+        _ = ok(.setDNS(primary: "9.9.9.9", secondary: ""))
+        XCTAssertEqual(commands.dns["USB LAN"], ["9.9.9.9"])
+        _ = ok(.setDNS(primary: "", secondary: ""))
+        XCTAssertEqual(commands.dns["USB LAN"], ["10.0.0.53"])
+    }
+
+    func testDNSRejectsNonIPAndRefusesWithoutTunnel() {
+        _ = ok(.up(tunnelID: UUID(), config: conf(1)))
+        XCTAssertNotNil(engine.handle(.setDNS(primary: "1.1.1.1; rm -rf /", secondary: "")).error)
+        XCTAssertNotNil(engine.handle(.setDNS(primary: "", secondary: "1.1.1.1")).error)
+        _ = ok(.downAll)
+        XCTAssertNotNil(engine.handle(.setDNS(primary: "1.1.1.1", secondary: "")).error)
+        XCTAssertEqual(commands.dns["Wi-Fi"], ["192.168.1.1"])
+    }
+
+    func testDisabledServicesAreNotTouched() {
+        commands.disabledServices = ["VPN Port"]
+        _ = ok(.up(tunnelID: UUID(), config: conf(1)))
+        _ = ok(.setDNS(primary: "9.9.9.9", secondary: ""))
+        XCTAssertFalse(commands.calls.contains { $0.args.contains("VPN Port") })
+    }
+
+    func testFailedUpOfOnlyTunnelRestoresDNS() {
+        let id = UUID()
+        _ = ok(.up(tunnelID: id, config: conf(1)))
+        _ = ok(.setDNS(primary: "9.9.9.9", secondary: ""))
+        // A restart (changed config) whose new attempt fails leaves no tunnel holding DNS.
+        commands.failUp = true
+        XCTAssertNotNil(engine.handle(.up(tunnelID: id, config: conf(2))).error)
+        XCTAssertEqual(commands.dns["Wi-Fi"], ["192.168.1.1"])
+    }
+
+    func testDownAllRestoresDNSAndDropsEverything() throws {
+        _ = ok(.up(tunnelID: UUID(), config: conf(1)))
+        _ = ok(.up(tunnelID: UUID(), config: conf(2)))
+        _ = ok(.setDNS(primary: "9.9.9.9", secondary: ""))
+        _ = ok(.downAll)
+        XCTAssertEqual(ok(.status).status?.tunnels.count, 0)
+        XCTAssertEqual(commands.dns["Wi-Fi"], ["192.168.1.1"])
+    }
+
+    func testCrashRecoveryAdoptsLiveTunnelsAndKeepsDNSSnapshot() throws {
+        let id = UUID()
+        _ = ok(.up(tunnelID: id, config: conf(1)))
+        _ = ok(.setDNS(primary: "9.9.9.9", secondary: ""))
+
+        let restarted = try HelperEngine(paths: paths, runner: commands)
+        restarted.recoverOnStart()
+        let status = try XCTUnwrap(restarted.handle(.status).status)
+        XCTAssertEqual(status.tunnels.map(\.tunnelID), [id])
+        XCTAssertEqual(commands.dns["Wi-Fi"], ["9.9.9.9"], "a live tunnel keeps the managed DNS")
+        _ = restarted.handle(.downAll)
+        XCTAssertEqual(commands.dns["Wi-Fi"], ["192.168.1.1"])
+    }
+
+    func testBootRecoveryRestoresDurableDNSSnapshotWhenNoTunnelSurvived() throws {
+        _ = ok(.up(tunnelID: UUID(), config: conf(1)))
+        _ = ok(.setDNS(primary: "9.9.9.9", secondary: ""))
+        // A reboot clears /var/run, including tunnel name files and session, but not the snapshot.
+        try FileManager.default.removeItem(at: paths.wireguardRunDir)
+        try FileManager.default.removeItem(at: paths.runtimeDir)
+
+        let rebooted = try HelperEngine(paths: paths, runner: commands)
+        rebooted.recoverOnStart()
+        XCTAssertEqual(commands.dns["Wi-Fi"], ["192.168.1.1"])
+        XCTAssertEqual(rebooted.handle(.status).status?.tunnels.count, 0)
+    }
+
+    func testFailedDNSRestoreKeepsSnapshotForRetry() throws {
+        let id = UUID()
+        _ = ok(.up(tunnelID: id, config: conf(1)))
+        _ = ok(.setDNS(primary: "9.9.9.9", secondary: ""))
+        commands.failSetDNS = true
+        XCTAssertNotNil(engine.handle(.down(tunnelID: id)).error)
+        commands.failSetDNS = false
+        let again = try HelperEngine(paths: paths, runner: commands)
+        again.recoverOnStart()
+        XCTAssertEqual(commands.dns["Wi-Fi"], ["192.168.1.1"])
+    }
+
+    // MARK: pure helpers
+
+    func testWgShowParsing() {
+        let peers = parseWgShow(handshakes: "\(testKey(2))\t0\n\(testKey(3))\t1700000000\n", transfer: "\(testKey(2))\t1\t2\n\(testKey(3))\t3\t4\n")
+        XCTAssertEqual(peers.count, 2)
+        XCTAssertNil(peers[0].latestHandshake, "0 means no handshake yet")
+        XCTAssertEqual(peers[1].txBytes, 4)
+    }
+
+    func testRedaction() {
+        XCTAssertEqual(redactSecrets("key \(testKey(1)) tail"), "key <redacted> tail")
+        XCTAssertEqual(redactSecrets("no secrets 10.0.0.1/24"), "no secrets 10.0.0.1/24")
+    }
+
+    func testRequestsRoundTripJSONAndOversizedRejected() throws {
+        let request = HelperRequest.up(tunnelID: UUID(), config: "x")
+        let decoded = try HelperRequest.decodeBounded(JSONEncoder().encode(request))
+        XCTAssertEqual(decoded, request)
+        XCTAssertThrowsError(try HelperRequest.decodeBounded(Data(repeating: 32, count: HelperConstants.maxRequestBytes + 1)))
+        XCTAssertThrowsError(try HelperRequest.decodeBounded(Data("{\"shell\":{\"cmd\":\"id\"}}".utf8)))
+    }
+}
+
+final class InstallProtocolTests: XCTestCase {
+    func testInstallAppleScriptEscapesPathAndUsesQuotedForm() {
+        let script = adminInstallAppleScript(helperPath: "/Applications/We\"ird $(id)\\.app/H", arguments: ["--install", "--uid", "501"])
+        XCTAssertEqual(script, "do shell script (quoted form of \"/Applications/We\\\"ird $(id)\\\\.app/H\") & \" '--install' '--uid' '501'\" with administrator privileges")
+    }
+
+    func testBundleLayoutDerivesAppFromHelperPath() {
+        let layout = AppBundleLayout(helperExecutable: URL(fileURLWithPath: "/Applications/WireNest.app/Contents/Library/LaunchServices/WireNestHelper"))
+        XCTAssertEqual(layout?.appBundle.path, "/Applications/WireNest.app")
+        XCTAssertEqual(layout?.toolsDir.path, "/Applications/WireNest.app/Contents/Resources/Tools")
+        XCTAssertNil(AppBundleLayout(helperExecutable: URL(fileURLWithPath: "/tmp/WireNestHelper")))
+    }
+
+    func testLaunchdPlistIsFixedAndKeepsTunnelsAcrossHelperExit() {
+        let plist = launchdPlist()
+        XCTAssertEqual(plist["Label"] as? String, "com.marcuschiu.WireNest.helper")
+        XCTAssertEqual(plist["ProgramArguments"] as? [String], ["/Library/PrivilegedHelperTools/com.marcuschiu.WireNest/WireNestHelper", "--daemon"])
+        XCTAssertEqual((plist["MachServices"] as? [String: Bool])?["com.marcuschiu.WireNest.helper"], true)
+        XCTAssertEqual(plist["AbandonProcessGroup"] as? Bool, true)
+        XCTAssertEqual(plist["RunAtLoad"] as? Bool, true)
+    }
+
+    func testClientRequirementPinsCdHash() {
+        XCTAssertEqual(HelperClientPin(ownerUID: 501, appCDHash: "abc123").codeRequirement, "cdhash H\"abc123\"")
+    }
+
+    func testPinValidationRejectsMalformed() {
+        XCTAssertNil(HelperClientPin(validating: 0, cdHash: Data([1, 2])))
+        XCTAssertNil(HelperClientPin(validating: 501, cdHash: Data()))
+        XCTAssertEqual(HelperClientPin(validating: 501, cdHash: Data([0xab, 0x01]))?.appCDHash, "ab01")
+    }
+}

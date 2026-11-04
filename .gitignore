@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+DerivedData/
+dist/
+*.xcodeproj/
+.DS_Store
+# WireGuard configurations hold private keys and must never be committed.
+*.conf
