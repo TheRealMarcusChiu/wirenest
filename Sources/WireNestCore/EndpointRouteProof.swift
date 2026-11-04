@@ -4,6 +4,8 @@ import Foundation
 /// connected physical or loopback route to it is more specific than the tunnel's `/1` routes. Read-only: it never
 /// adds a route. Anything unknown, malformed or ambiguous is a refusal.
 public enum EndpointRouteProof {
+    static let throughGatewayRefusal = "its route goes through a gateway"
+
     /// Why the endpoint is not proven, or nil if it is.
     public static func refusal(endpoint: String, ownedInterfaces: Set<String>, runner: CommandRunning) -> String? {
         refusal(
@@ -42,7 +44,7 @@ public enum EndpointRouteProof {
         }
 
         guard lookup.flags.isDisjoint(with: ["REJECT", "BLACKHOLE"]) else { return "its route is a reject or blackhole route" }
-        guard !lookup.flags.contains("GATEWAY") else { return "its route goes through a gateway" }
+        guard !lookup.flags.contains("GATEWAY") else { return throughGatewayRefusal }
         guard !ownedInterfaces.contains(lookup.interface) else { return "its route goes into a WireNest tunnel" }
         guard let interface = interfaces[lookup.interface] else { return "its route uses an unknown interface" }
 
@@ -94,6 +96,31 @@ public enum EndpointRouteProof {
 
 public enum InterfacePresence: Equatable {
     case present, absent, unknown
+}
+
+/// Which check of `gatewayRouteProven` failed, in fixed words. Nothing from a command's output reaches this.
+public enum GatewayRouteProofFailure: Equatable {
+    case tableUnreadable, noPinnedRow, differentRow, ambiguousRow
+    case lookupFailed, lookupMalformed, lookupDestination, lookupGateway, lookupInterface
+    case lookupCached, lookupRejected, lookupFlags, lookupMask
+
+    public var description: String {
+        switch self {
+        case .tableUnreadable: return "the routing table could not be read"
+        case .noPinnedRow: return "it has no protective host route"
+        case .differentRow: return "its host route is not the one through the current physical gateway"
+        case .ambiguousRow: return "its host route is ambiguous, with another route to it beside the matching one"
+        case .lookupFailed: return "the ordinary route lookup failed"
+        case .lookupMalformed: return "the ordinary route lookup could not be understood"
+        case .lookupDestination: return "the ordinary route lookup selects another destination"
+        case .lookupGateway: return "the ordinary route lookup selects another gateway"
+        case .lookupInterface: return "the ordinary route lookup selects another interface"
+        case .lookupCached: return "the ordinary route lookup selects a cached scoped route instead of the protective host route"
+        case .lookupRejected: return "the ordinary route lookup selects a reject or blackhole route"
+        case .lookupFlags: return "the ordinary route lookup does not show a static gateway host route"
+        case .lookupMask: return "the ordinary route lookup selects a route wider than a host"
+        }
+    }
 }
 
 /// The only kind of gateway a protective endpoint route may use, derived from the kernel's own default route.
@@ -182,12 +209,29 @@ extension EndpointRouteProof {
 
     /// The exact pinned row in the kernel's table, and an ordinary lookup that actually selects it.
     public static func gatewayRouteProven(endpoint: String, via physical: PhysicalGateway, netstat: CommandResult, routeLookup: CommandResult) -> Bool {
-        guard endpointRow(endpoint, gateway: physical.gateway, interface: physical.interface, netstat: netstat) == .exact,
-              routeLookup.status == 0, let lookup = RouteLookup(routeLookup.output), let value = ipv4Value(endpoint) else { return false }
-        return lookup.destination.flatMap(ipv4Value) == value && lookup.gateway == physical.gateway && lookup.interface == physical.interface
-            && lookup.flags.isSuperset(of: ["HOST", "GATEWAY", "STATIC"])
-            && lookup.flags.isDisjoint(with: ["REJECT", "BLACKHOLE", "WASCLONED", "IFSCOPE"])
-            && lookup.mask.map { prefixLength(ofMask: $0) == 32 } ?? true
+        gatewayRouteFailure(endpoint: endpoint, via: physical, netstat: netstat, routeLookup: routeLookup) == nil
+    }
+
+    /// The first check `gatewayRouteProven` fails, or nil if it holds.
+    public static func gatewayRouteFailure(endpoint: String, via physical: PhysicalGateway, netstat: CommandResult, routeLookup: CommandResult) -> GatewayRouteProofFailure? {
+        switch endpointRow(endpoint, gateway: physical.gateway, interface: physical.interface, netstat: netstat) {
+        case .unknown: return .tableUnreadable
+        case .absent, .cloneOnly: return .noPinnedRow
+        case .foreign: return .differentRow
+        case .mixed: return .ambiguousRow
+        case .exact: break
+        }
+        guard routeLookup.status == 0 else { return .lookupFailed }
+        guard let lookup = RouteLookup(routeLookup.output) else { return .lookupMalformed }
+        // endpointRow above already refused an endpoint that is not IPv4.
+        guard let value = ipv4Value(endpoint), lookup.destination.flatMap(ipv4Value) == value else { return .lookupDestination }
+        guard lookup.gateway == physical.gateway else { return .lookupGateway }
+        guard lookup.interface == physical.interface else { return .lookupInterface }
+        guard lookup.flags.isDisjoint(with: ["WASCLONED", "IFSCOPE"]) else { return .lookupCached }
+        guard lookup.flags.isDisjoint(with: ["REJECT", "BLACKHOLE"]) else { return .lookupRejected }
+        guard lookup.flags.isSuperset(of: ["HOST", "GATEWAY", "STATIC"]) else { return .lookupFlags }
+        guard lookup.mask.map({ prefixLength(ofMask: $0) == 32 }) ?? true else { return .lookupMask }
+        return nil
     }
 }
 

@@ -296,8 +296,10 @@ public final class HelperEngine {
             }
             if deferring.contains(endpoint) { continue }
             if let reason = EndpointRouteProof.refusal(endpoint: endpoint, ownedInterfaces: owned, runner: runner) {
-                if gatewayRouteProven(endpoint, ownedInterfaces: owned) { continue }
-                return unsafeRouteMessage(endpoint, reason: endpointRouteProblems[endpoint]?.reason ?? reason)
+                guard let failure = gatewayRouteFailure(endpoint, ownedInterfaces: owned) else { continue }
+                // "Through a gateway" is expected of a protective route, so here the failed check says more. Any other refusal is already specific.
+                let specific = reason == EndpointRouteProof.throughGatewayRefusal ? failure : reason
+                return unsafeRouteMessage(endpoint, reason: endpointRouteProblems[endpoint]?.reason ?? specific)
             }
         }
         return nil
@@ -305,7 +307,7 @@ public final class HelperEngine {
 
     private func unsafeRouteMessage(_ endpoint: String, reason: String) -> String {
         let tail = endpointRouteProblems[endpoint]?.tail
-            ?? (session.endpointRoutes.isEmpty ? Self.noRouteAdded : "Protective routes already added stay tracked until they can be removed.")
+            ?? (session.endpointRoutes.isEmpty ? Self.noRouteAdded : "WireNest removes its own protective routes when they are no longer needed; unresolved cleanup stays tracked.")
         return "Cannot safely run this tunnel beside the default-route tunnel: no proven physical-LAN, loopback or gateway route to \(endpoint) more specific than its /1 routes (\(reason)). \(tail)"
     }
 
@@ -339,20 +341,20 @@ public final class HelperEngine {
         return hosts
     }
 
-    /// A row found exact counts only under the gateway the kernel uses now, and never while our own unconfirmed add is outstanding.
-    private func gatewayRouteProven(_ endpoint: String, ownedInterfaces owned: Set<String>) -> Bool {
-        guard session.endpointRoutes[endpoint]?.phase != .adding else { return false }
+    /// Why no protective route is proven, or nil if one is. A row found exact counts only under the gateway the kernel uses now, and never while our own unconfirmed add is outstanding.
+    private func gatewayRouteFailure(_ endpoint: String, ownedInterfaces owned: Set<String>) -> String? {
+        guard session.endpointRoutes[endpoint]?.phase != .adding else { return "an earlier route add is still unconfirmed" }
         let table = EndpointRouteProof.readRoutingTable(runner)
         guard let physical = EndpointRouteProof.physicalGateway(
             netstat: table,
             ifconfig: runner.run("/sbin/ifconfig", ["-a"], timeout: 5, readyMarker: nil),
             hardwarePorts: runner.run("/usr/sbin/networksetup", ["-listallhardwareports"], timeout: 15, readyMarker: nil),
             ownedInterfaces: owned
-        ) else { return false }
-        return EndpointRouteProof.gatewayRouteProven(
+        ) else { return "the physical default gateway could not be proven" }
+        return EndpointRouteProof.gatewayRouteFailure(
             endpoint: endpoint, via: physical, netstat: table,
             routeLookup: runner.run(Self.routeTool, ["-n", "get", "-inet", endpoint], timeout: 5, readyMarker: nil)
-        )
+        )?.description
     }
 
     // MARK: Endpoint routes

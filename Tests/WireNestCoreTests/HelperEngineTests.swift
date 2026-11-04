@@ -45,6 +45,8 @@ final class FakeCommands: CommandRunning {
     var netstatResult: CommandResult?
     /// Stock wg-quick pins a default-route tunnel's own numeric endpoint on `up` and deletes it on `down`.
     var wgQuickManagesOwnEndpoint = false
+    /// Replaces the flags an ordinary lookup reports for a host row. The kernel may select another row than the pinned one.
+    var hostLookupFlags: String?
     /// Called with `add` or `delete` before each route change, while the journal can still be read as it was.
     var onRouteChange: ((String) -> Void)?
 
@@ -217,7 +219,7 @@ final class FakeCommands: CommandRunning {
             let address = args.last ?? ""
             if let row = hostRoutes[address] {
                 let fields = row.split(whereSeparator: \.isWhitespace).map(String.init)
-                let flags = fields[2].contains("W") ? "UP,GATEWAY,HOST,DONE,WASCLONED,IFSCOPE" : "UP,GATEWAY,HOST,DONE,STATIC"
+                let flags = hostLookupFlags ?? (fields[2].contains("W") ? "UP,GATEWAY,HOST,DONE,WASCLONED,IFSCOPE" : "UP,GATEWAY,HOST,DONE,STATIC")
                 return CommandResult(status: 0, output: """
                    route to: \(address)
                 destination: \(address)

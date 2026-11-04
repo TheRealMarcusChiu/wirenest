@@ -672,6 +672,69 @@ final class PhysicalGatewayParsingTests: XCTestCase {
             + "    gateway: \(gateway)\n  interface: \(interface)\n      flags: <\(flags)>\n"
     }
 
+    /// Which check failed, without changing what fails: every reason here is also a refusal by `gatewayRouteProven`.
+    func testEachGatewayProofFailureHasItsOwnReason() {
+        let pinned = "203.0.113.50 192.168.86.1 UGHS en0\n"
+        let clone = "203.0.113.50 192.168.86.1 UGHWIig en0\n"
+        let cached = "UP,GATEWAY,HOST,DONE,WASCLONED,IFSCOPE"
+        func failure(_ lookupText: String, status: Int32 = 0, netstat: CommandResult? = nil, extra: String? = nil) -> GatewayRouteProofFailure? {
+            EndpointRouteProof.gatewayRouteFailure(
+                endpoint: "203.0.113.50", via: PhysicalGateway(gateway: "192.168.86.1", interface: "en0"),
+                netstat: netstat ?? good(table + (extra ?? pinned)), routeLookup: CommandResult(status: status, output: lookupText)
+            )
+        }
+        XCTAssertNil(failure(lookup()))
+        XCTAssertNil(failure(lookup(mask: "255.255.255.255")))
+
+        let cases: [(String, GatewayRouteProofFailure, GatewayRouteProofFailure?)] = [
+            ("unreadable table", .tableUnreadable, failure(lookup(), netstat: CommandResult(status: 124, output: ""))),
+            ("cut table", .tableUnreadable, failure(lookup(), netstat: good(table + pinned + String(repeating: "x", count: HelperConstants.maxCommandOutputBytes)))),
+            ("malformed table", .tableUnreadable, failure(lookup(), netstat: good(table + pinned + "broken\n"))),
+            ("no row", .noPinnedRow, failure(lookup(), extra: "")),
+            ("a clone is no pinned row", .noPinnedRow, failure(lookup(flags: cached), extra: clone)),
+            ("another row", .differentRow, failure(lookup(), extra: "203.0.113.50 192.168.86.9 UGHS en0\n")),
+            ("our row beside another", .ambiguousRow, failure(lookup(), extra: pinned + "203.0.113.50 192.168.90.1 UGHSI en1\n")),
+            ("the same row twice", .ambiguousRow, failure(lookup(), extra: pinned + pinned)),
+            ("failed lookup", .lookupFailed, failure(lookup(), status: 1)),
+            ("timed out lookup", .lookupFailed, failure("", status: 124)),
+            ("malformed lookup", .lookupMalformed, failure("garbage")),
+            ("destination", .lookupDestination, failure(lookup(destination: "default"))),
+            ("gateway", .lookupGateway, failure(lookup(gateway: "192.168.86.9"))),
+            ("interface", .lookupInterface, failure(lookup(interface: "utun8"))),
+            ("the row the kernel chose is cached", .lookupCached, failure(lookup(flags: cached), extra: pinned + clone)),
+            ("cloned alone", .lookupCached, failure(lookup(flags: "UP,GATEWAY,HOST,DONE,STATIC,WASCLONED"))),
+            ("scoped alone", .lookupCached, failure(lookup(flags: "UP,GATEWAY,HOST,DONE,STATIC,IFSCOPE"))),
+            ("a cached row on the wrong gateway", .lookupGateway, failure(lookup(gateway: "192.168.86.9", flags: cached), extra: pinned + clone)),
+            ("reject", .lookupRejected, failure(lookup(flags: "UP,GATEWAY,HOST,DONE,STATIC,REJECT"))),
+            ("blackhole", .lookupRejected, failure(lookup(flags: "UP,GATEWAY,HOST,DONE,STATIC,BLACKHOLE"))),
+            ("not static", .lookupFlags, failure(lookup(flags: "UP,GATEWAY,HOST,DONE"))),
+            ("not a host", .lookupFlags, failure(lookup(flags: "UP,GATEWAY,DONE,STATIC"))),
+            ("no gateway", .lookupFlags, failure(lookup(flags: "UP,HOST,DONE,STATIC"))),
+            ("mask", .lookupMask, failure(lookup(mask: "255.255.255.0"))),
+        ]
+        for (label, expected, actual) in cases { XCTAssertEqual(actual, expected, label) }
+
+        // A reason only ever explains a refusal: the same inputs are refused by the Bool, and accepted when there is none.
+        XCTAssertTrue(proven(lookup: lookup()))
+        XCTAssertFalse(proven(lookup: lookup(flags: cached), extra: pinned + clone), "cached is named, not accepted")
+        XCTAssertFalse(proven(lookup: lookup(flags: cached), extra: clone))
+        XCTAssertFalse(proven(lookup: lookup(gateway: "192.168.86.9", flags: cached), extra: pinned + clone))
+        XCTAssertFalse(proven(lookup: lookup(interface: "utun8", flags: cached), extra: pinned + clone))
+    }
+
+    func testGatewayProofReasonsAreFixedTextOnly() {
+        let hostile = "SECRETKEY aa:bb:cc:dd:ee:ff vpn-user 203.0.113.77"
+        let reason = EndpointRouteProof.gatewayRouteFailure(
+            endpoint: "203.0.113.50", via: PhysicalGateway(gateway: "192.168.86.1", interface: "en0"),
+            netstat: good(table + "203.0.113.50 192.168.86.1 UGHS en0\n"), routeLookup: CommandResult(status: 1, output: hostile)
+        )?.description
+        XCTAssertEqual(reason, GatewayRouteProofFailure.lookupFailed.description)
+        for value in ["SECRETKEY", "aa:bb", "vpn-user", "203.0.113", "192.168.86"] {
+            XCTAssertFalse(reason?.contains(value) == true, value)
+        }
+        XCTAssertEqual(EndpointRouteProof.throughGatewayRefusal, "its route goes through a gateway", "the connected-route refusal's own text is unchanged")
+    }
+
     func testAGatewayRouteIsProvenOnlyByTheRowAndAnOrdinaryLookupTogether() {
         XCTAssertTrue(proven(lookup: lookup()))
         XCTAssertTrue(proven(lookup: lookup(mask: "255.255.255.255")))
@@ -1196,6 +1259,95 @@ final class GatewayEndpointRootTests: XCTestCase {
     // MARK: the default owner's own endpoint is wg-quick's
 
     private lazy var sharedFull = confText(address: "10.128.0.2/32", allowedIPs: "0.0.0.0/0", endpoint: "\(endpoint):1637")
+
+    // MARK: saying which check failed
+
+    private let cachedFlags = "UP,GATEWAY,HOST,DONE,WASCLONED,IFSCOPE"
+    private let rollbackTail = "WireNest removes its own protective routes when they are no longer needed; unresolved cleanup stays tracked."
+
+    func testAStartRefusedByACachedLookupSaysSoAndIsStillRefused() throws {
+        ok(.up(tunnelID: splitID, config: split))
+        commands.hostLookupFlags = cachedFlags
+        let error = try XCTUnwrap(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        XCTAssertTrue(error.contains(GatewayRouteProofFailure.lookupCached.description), error)
+        XCTAssertFalse(error.contains(EndpointRouteProof.throughGatewayRefusal), error)
+        XCTAssertTrue(error.contains(rollbackTail), error)
+        XCTAssertFalse(error.contains("stay tracked until"), error)
+        XCTAssertEqual(upCount, 1, "named, not accepted: the capturing tunnel never starts")
+
+        // Everything else about the attempt is what it was.
+        XCTAssertEqual(adds.count, 1)
+        XCTAssertEqual(deletes, [["-q", "-n", "delete", "-inet", endpoint, "192.168.86.1"]], "the route we added is rolled back")
+        XCTAssertFalse(journal.contains(endpoint))
+        XCTAssertTrue(running(splitID))
+    }
+
+    func testARunningPairReportsTheReasonThroughRouteFailure() {
+        startPair()
+        commands.hostLookupFlags = cachedFlags
+        let after = status
+        XCTAssertTrue(after.routeFailure?.contains(GatewayRouteProofFailure.lookupCached.description) == true, after.routeFailure ?? "")
+        XCTAssertFalse(after.routeFailure?.contains(EndpointRouteProof.throughGatewayRefusal) == true)
+        XCTAssertFalse(after.tunnels.contains { $0.tunnelID == fullID }, "contained exactly as before")
+        XCTAssertTrue(after.tunnels.contains { $0.tunnelID == splitID && $0.alive })
+    }
+
+    func testATrackedRowWithNoProvableGatewaySaysSo() {
+        startPair()
+        commands.netstatBase = commands.netstatBase.replacingOccurrences(of: "default            192.168.86.1       UGScg                 en0\n", with: "")
+        let after = status
+        XCTAssertTrue(after.routeFailure?.contains("physical default gateway could not be proven") == true, after.routeFailure ?? "")
+        XCTAssertFalse(after.routeFailure?.contains(EndpointRouteProof.throughGatewayRefusal) == true)
+        XCTAssertFalse(after.tunnels.contains { $0.tunnelID == fullID })
+    }
+
+    func testAMovedGatewaySaysTheRowIsNotTheCurrentOne() {
+        startPair()
+        commands.netstatBase = commands.netstatBase.replacingOccurrences(of: "192.168.86.1 ", with: "192.168.86.2 ")
+        let after = status
+        XCTAssertTrue(after.routeFailure?.contains(GatewayRouteProofFailure.differentRow.description) == true, after.routeFailure ?? "")
+        XCTAssertFalse(after.tunnels.contains { $0.tunnelID == fullID })
+    }
+
+    func testAMixedRowSaysItIsAmbiguousThroughTheExistingProblem() {
+        startPair()
+        commands.hostRoutes[endpoint] = "\(endpoint)     192.168.86.1     UGHS     en0\n\(endpoint)     192.168.90.1     UGHSI     en1\n"
+        XCTAssertTrue(status.routeFailure?.contains("another route to it exists beside the protective one") == true, "creation and ownership problems keep priority")
+    }
+
+    func testAnOutstandingAddStillKeepsItsSpecificProblemFirst() throws {
+        ok(.up(tunnelID: splitID, config: split))
+        commands.routeAddResult = CommandResult(status: 124, output: "Timed out")
+        let error = try XCTUnwrap(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        XCTAssertTrue(error.contains("adding the route timed out"), error)
+        XCTAssertFalse(error.contains(rollbackTail), "that tail is for a route with no specific problem")
+    }
+
+    func testAnUnconfirmedAddWithNoProblemOfItsOwnStillHasASpecificReason() throws {
+        // Shared with the default owner, so no reconcile looks at it and only the proof can say why.
+        commands.wgQuickManagesOwnEndpoint = true
+        let sharedOwner = confText(address: "10.128.0.2/32", allowedIPs: "0.0.0.0/0", endpoint: "\(endpoint):1637")
+        ok(.up(tunnelID: fullID, config: sharedOwner))
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: journalURL)) as? [String: Any])
+        object["endpointRoutes"] = [endpoint: ["gateway": "192.168.86.1", "interface": "en0", "phase": "adding"]]
+        try JSONSerialization.data(withJSONObject: object).write(to: journalURL)
+        engine = try restarted()
+
+        let error = try XCTUnwrap(engine.handle(.up(tunnelID: splitID, config: split)).error)
+        XCTAssertTrue(error.contains("an earlier route add is still unconfirmed"), error)
+        XCTAssertFalse(error.contains(EndpointRouteProof.throughGatewayRefusal), error)
+        XCTAssertTrue(deletes.isEmpty)
+    }
+
+    func testAConnectedRouteRefusalKeepsItsOwnSpecificReason() throws {
+        // A LAN endpoint behind a hostname owner, so nothing is reconciled and the refusal that fired is the specific one.
+        let lanSplit = confText(address: "10.20.0.2/32", allowedIPs: "192.168.111.0/24", endpoint: "192.168.86.51:51820")
+        let namedFull = confText(address: "10.128.0.2/32", allowedIPs: "0.0.0.0/0", endpoint: "vpn.example.com:1637")
+        ok(.up(tunnelID: fullID, config: namedFull))
+        commands.routeGet["192.168.86.51"] = CommandResult(status: 0, output: "   route to: 192.168.86.51\ndestination: 128.0.0.0\n       mask: 128.0.0.0\n  interface: utun7\n      flags: <UP,DONE,STATIC>\n")
+        let error = try XCTUnwrap(engine.handle(.up(tunnelID: splitID, config: lanSplit)).error)
+        XCTAssertTrue(error.contains("its route goes into a WireNest tunnel"), error)
+    }
 
     func testASharedEndpointIsBorrowedFromWgQuickInBothOrders() {
         commands.wgQuickManagesOwnEndpoint = true
