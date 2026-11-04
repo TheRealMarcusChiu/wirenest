@@ -4,7 +4,7 @@ WireNest is a native macOS menu-bar app for WireGuard. It keeps named connection
 
 It requires macOS 13 or later.
 
-> **There is no installer release yet.** Security and behavior fixes to the root helper are still pending. WireNest has not been tested on real Mac hardware or with real VPN servers, so don't rely on it to protect real traffic. See [What has been tested](#what-has-been-tested).
+> **There is no installer release yet.** The repaired privileged-helper path has passed native CI and a bounded source review. Conditional full-tunnel/local-tunnel routing is now implemented but still awaits its own validation. WireNest has not been tested on physical Mac hardware or with real VPN servers, so don't rely on it to protect real traffic. See [What has been tested](#what-has-been-tested).
 
 ## Features
 
@@ -13,7 +13,7 @@ These are implemented, but most have not been tested end to end.
 - **Connections:** create several, each with its own tunnels, and turn the active one on, off, or switch to another. If you disconnect, it stays off, even after a restart.
 - **Private imports:** importing a `.conf` file copies it into storage only your account can read. Later changes to the original have no effect.
 - **Editing:** duplicate a tunnel or edit its configuration, including multiple `AllowedIPs` ranges. Hooks such as `PostUp`, `SaveConfig`, and unknown settings are rejected.
-- **Route conflicts:** tunnels with overlapping routes are rejected until you resolve the overlap. Only one tunnel can own the default route.
+- **Route conflicts:** only one tunnel can own each address family's default route. One IPv4 full tunnel can coexist with disjoint narrower tunnels only when the helper proves existing, more-specific physical-LAN or loopback routes protect their endpoints. It checks the actual kernel routes before and after startup and while running; it does not add bypass routes. Unproven protection, competing `/1` routes, overlapping narrower routes, and unsupported IPv6 overlap remain errors. This conditional mode still needs actual-default-route verification.
 - **DNS:** set a primary and optional secondary server per connection. The original settings are restored afterwards, and an empty primary leaves system DNS alone. macOS does not guarantee strict failover between the two.
 - **Recovery:** only the failed tunnel is restarted, with increasing delays. A tunnel isn't treated as failed just because it has been idle.
 - **Network rules:** choose a connection based on the Wi-Fi name (equals or does not equal), or optionally when your public IP changes. A manual disconnect takes priority over rules. An unknown Wi-Fi name never matches a "does not equal" rule.
@@ -53,23 +53,24 @@ WireGuard tunnels need root to create network interfaces and change routes, so W
 
 ## What has been tested
 
-[CI run 41753758485](https://github.com/TheRealMarcusChiu/wirenest/actions/runs/41753758485), at commit `6ae7ce0`, passed all of the following on GitHub's Apple silicon and Intel macOS 15 runners:
+[CI run 41760761375](https://github.com/TheRealMarcusChiu/wirenest/actions/runs/41760761375), at commit `59094ec` (before the conditional-routing changes), passed on GitHub's Apple silicon and Intel macOS 15 runners:
 
-- All 112 Swift tests.
+- All 218 Swift tests on each architecture.
 - Maintainer signature checks on the upstream sources.
 - Building the app and bundled tools, and checking that they link only system libraries.
 - Creating, mounting, and checking the DMG.
 - Starting the app and helper binaries from the DMG to confirm that they load. This shows nothing about helper installation, IPC, or caller authentication.
 - A real two-tunnel test with `scripts/smoke-two-tunnels.sh`.
+- The authenticated app-to-root-helper test with `scripts/smoke-helper.sh`: real installation, simultaneous tunnel traffic, independent restarts, teardown and uninstallation, with network-state restoration checked.
+- A real installer ACL regression: the signed source tools were deliberately given user-write grants, installation removed the grants, and ordinary-user write/append/create attempts against the installed tools were denied.
 
-That test uses the bundled `bash`, `wg`, `wg-quick`, and `wireguard-go` directly, without the app or helper. It starts two tunnels with throwaway keys to peers on the same machine, sends TCP traffic through each, stops one while the other keeps working, and confirms that the default route and DNS didn't change.
+The direct two-tunnel test uses the bundled `bash`, `wg`, `wg-quick`, and `wireguard-go` directly, without the app or helper. It starts two tunnels with throwaway keys to peers on the same machine, sends TCP traffic through each, stops one while the other keeps working, and confirms that the default route and DNS didn't change.
 
-A second CI test, `scripts/smoke-helper.sh`, is meant to cover the path from the app through its authenticated connection to the root helper: installing the helper, then starting, restarting, and stopping tunnels. **It's configured but hasn't run or passed yet.** It's waiting on the pending root helper security, DNS, and health fixes. Even once it passes, it won't cover the menu-bar UI, Wi-Fi rules, start at login, sleep/wake, or WireNest changing DNS.
+The app-to-helper test uses generated keys, reserved test networks and userspace peers. It does not install a default route or change DNS. Its success must not be treated as proof of the new full-tunnel/local-tunnel combination, the menu-bar UI, Wi-Fi rules, start at login, sleep/wake, or actual DNS mutation. Separate read-only observations from both native runner architectures ground the new route parser, but do not prove behavior with default-capturing routes installed.
 
 **Not tested yet:**
 
-- The app and helper running a tunnel together
-- Root helper installation and IPC
+- Actual-default-route behavior of the new conditional full-tunnel/local-tunnel mode
 - WireNest's DNS changes and restoration
 - Failure recovery and sleep/wake handling
 - Using the menu-bar UI
