@@ -64,7 +64,7 @@ final class RouteConflictTests: XCTestCase {
     }
 
     func testIPv6DefaultRouteConflictsWithAnotherTunnelsAddressAlone() throws {
-        let v6 =confText(address: "fd01::2/128", allowedIPs: "::/0", endpoint: "[2001:db8::1]:51820")
+        let v6 = confText(address: "fd01::2/128", allowedIPs: "::/0", endpoint: "[2001:db8::1]:51820")
         let c = confText(address: "fd02::2/128", allowedIPs: "10.2.0.0/24", endpoint: "198.51.100.1:51820")
         XCTAssertEqual(try kinds(v6, c), [.overlappingRoutes])
     }
