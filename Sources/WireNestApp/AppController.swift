@@ -217,7 +217,11 @@ final class AppController: ObservableObject {
 
     /// Re-applied after changes and periodically: networksetup settings can change, and new services can appear.
     private func applyDNS(status: HelperStatus, desired: [DesiredTunnel]) async {
-        guard !desired.isEmpty, !status.tunnels.isEmpty, pauseReason == nil,
+        if status.tunnels.isEmpty {
+            await restoreDNSIfPending(status)
+            return
+        }
+        guard !desired.isEmpty, pauseReason == nil,
               let id = state.activeProfileID, let profile = state.profile(id) else { return }
         guard dnsDirty || ticks % Self.dnsRefreshTicks == 0 else { return }
         guard !profile.primaryDNS.isEmpty || status.dnsManaged else {
@@ -230,6 +234,24 @@ final class AppController: ObservableObject {
             dnsError = nil
         } catch {
             dnsError = error.localizedDescription
+        }
+    }
+
+    /// With no tunnels left, nothing else would ever ask the helper to finish restoring DNS. Retried about once a minute, or by Retry Now.
+    private func restoreDNSIfPending(_ status: HelperStatus) async {
+        guard status.dnsManaged else {
+            dnsError = nil
+            return
+        }
+        guard dnsDirty || ticks % Self.dnsRefreshTicks == 0 else { return }
+        dnsDirty = false
+        do {
+            let after = try await helper.send(.setDNS(primary: "", secondary: ""))
+            dnsError = after.dnsManaged
+                ? "Original DNS will be restored when these network services are enabled: \(after.dnsPendingServices.joined(separator: ", "))."
+                : nil
+        } catch {
+            dnsError = "Could not restore your original DNS, and will keep trying: \(error.localizedDescription)"
         }
     }
 

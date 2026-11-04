@@ -6,10 +6,12 @@ architecture, the contract with packaging, and what has and has not been verifie
 
 ## Verification status
 
-No Swift toolchain exists on the host where this code was written. **Nothing here has been compiled
-or run yet.** Tests were written first but RED could not be observed. Compiler, `swift test` and
-real-Mac evidence are deferred to macOS CI and hands-on testing. Until then, treat every behavior
-below as designed, not proven.
+No Swift toolchain exists on the host where this code was written, so tests were written first but RED
+could not be observed. The integration coordinator reports that an earlier candidate passed macOS CI,
+including its tests and a sidecar two-tunnel run, but that run did not exercise the root helper path. The
+later network-policy and helper-lifecycle repairs have not been compiled or run. Treat those behaviors,
+and everything that depends on the helper, as designed and not proven until macOS CI, the authenticated
+helper proof below and hands-on testing pass.
 
 ## Targets
 
@@ -81,8 +83,12 @@ starting its UI.
 
 ## Security model
 
-- **Install.** As root, verify the bundle signature, then copy the helper and tools out of the
-  user-writable bundle into a root-owned directory. Nothing user-writable executes as root.
+- **Install.** As root, copy the whole app into a private 0700 root-owned staging directory, strip
+  write bits, and reject anything but regular files and folders. Then verify that snapshot's signature
+  (all architectures, nested code, sealed resources), derive the client pin from it, and install only
+  its bytes. Changing the original bundle after the copy cannot affect the result, and an existing
+  install is untouched until verification passes and is put back if bootstrap fails. An ad-hoc signature
+  proves self-consistency, not authorship: this installs whichever app the administrator chose.
 - **Caller authentication.** The listener's `setConnectionCodeSigningRequirement` pins the CDHash of
   this app build (native architecture), and `effectiveUserIdentifier` pins the installing user. The
   pin file counts only if it is root-owned and not group- or world-writable.
@@ -90,7 +96,8 @@ starting its UI.
   `down`, `downAll`, `setDNS`. No request can name an executable, path or argument.
 - **Re-validation.** The helper re-parses every config and re-checks route conflicts and DNS. It writes
   only text generated from typed fields, never the text it received.
-- **Subprocesses.** Fixed absolute paths, a fixed `PATH`, no shell, a hard timeout.
+- **Subprocesses.** Fixed absolute paths, a fixed `PATH`, no shell, a hard timeout, and a new process
+  group for each command.
 - **Keys.** The app stores them in a 0600 file inside a 0700 directory
   (`~/Library/Application Support/WireNest/state.json`), chosen over Keychain because ad-hoc builds
   have unstable Keychain ACLs. At runtime keys sit in a root-only 0600 file deleted on `down`. They
@@ -159,11 +166,50 @@ reported as unused, and configured DNS is never overwritten. The helper snapshot
 change, re-applies idempotently, and restores after the last tunnel stops or on the next helper start
 if none survived. An empty primary leaves system DNS alone. Server order is not guaranteed failover.
 
+A journal entry leaves only once its service is confirmed restored. A disabled service keeps its entry
+until it can be restored, while other services are restored now; a service that no longer exists at all
+is dropped. A pending original is never replaced by a managed value. An unreadable journal is reported
+and kept, and blocks new DNS changes. With no tunnels left, the app retries a pending restore about once
+a minute and on Retry Now, and shows why it is still pending. Removing the helper refuses to discard
+pending originals.
+
 **Limit.** A DNS change made by the user while connected is overwritten and not added to the snapshot.
+
+### Tunnel lifecycle in the helper
+
+A journal in the root-only runtime directory records each tunnel as `starting`, `running` or `retiring`.
+It is written before any root action, and a failed write stops that action, so no tunnel is ever untracked.
+
+**Start.** `wg-quick` printing its ready line proves nothing: that line comes before the route monitor is
+forked. A start counts only once `wg-quick` has exited 0, or has forked the monitor while blocked in its
+launchd `wait`, and then the socket exists, the device answers `wg show` with exactly this config's
+peers, and the monitor is running. Anything else rolls back.
+
+**Stop.** `wg-quick down` only removes the socket. wireguard-go and the utun then go, and only then does
+the route monitor notice, delete its routes and exit. The monitor's exit is therefore the proof of
+finished cleanup, and the slot and its config stay reserved until it has happened, with a 20 second limit.
+Past half of that, the helper does what `wg-quick` would (removes the socket) and sends SIGTERM to the
+monitor's process group, which runs its cleanup trap.
+
+**Barrier.** A monitor outliving its tunnel would watch any tunnel that reuses its utun number and then
+delete that tunnel's routes, so no new tunnel starts while any teardown is unfinished. A failure stays
+journaled, is reported, and is retried by the next `down`, `up` or helper start. Other running tunnels are
+never touched, and DNS is restored only after the last tunnel is really gone.
+
+**Ownership.** The route monitor is a fork of `wg-quick up`, so it keeps that exact argv, including the
+config path in this root-only directory. Processes are matched on a root real UID and the whole argv, read
+from the kernel, which works after a helper restart with no stored PID to go stale. Only that process's own
+group is ever signalled, and each `wg-quick` has a group of its own. On start the helper re-adopts live
+`running` tunnels and finishes `starting`, `retiring` and dead ones. A `wnN.conf` with no journal entry is
+treated as an interrupted tunnel of ours. Nothing else in the directory is touched.
+
+**Limits.** Past the halfway point, a utun that `wg` cannot reach is assumed to be another app reusing
+the number, since utun numbers are shared, so a hung wireguard-go would pass as that. Endpoint host routes
+are deleted by the monitor's trap and are not independently verified.
 
 ### Health and recovery
 
-Every 5 seconds the app reads real handshakes and counters from `wg`:
+Every 5 seconds the app reads real handshakes and counters from `wg`, and judges each peer by its own:
 
 | Observation | State | Restart? |
 | --- | --- | --- |
@@ -173,6 +219,11 @@ Every 5 seconds the app reads real handshakes and counters from `wg`:
 | No handshake yet, no outbound growth | connecting | no |
 | Outbound growing, no reply for 45 s | degraded | no |
 | Outbound growing, no reply for 180 s | degraded | yes |
+
+A tunnel takes its worst peer's result, so a fresh peer cannot hide a stalled one, and one peer's replies
+do not clear another's stall. A peer that never handshook and sends nothing leaves the tunnel `connecting`
+but never restarts it. New peers and counters that went backwards get a fresh baseline. The backoff resets
+only when no peer is stalled or waiting for a first handshake and at least one is fresh.
 
 Each tunnel has its own backoff (2 s doubling to 300 s, ±20% jitter, reset after 120 s healthy), and
 only that tunnel restarts. Wake and path changes re-check immediately and grant 30 s of grace, so they
@@ -219,11 +270,28 @@ After it fires, a pin holds the choice until the network changes again, so lower
 | `StateTests` | By-value import, duplicate, edit, toggles, manual off, persistence, permissions, corruption |
 | `RuleEngineTests` | SSID rules and fail-closed, priority, debounce, dwell, override, pin, public IP range and change trigger |
 | `NetworkPolicyTests` | SSID eligibility, pause and resume against the real engine, older state decoding, import DNS seeding |
-| `SupervisorTests` | Backoff, health table, per-tunnel restarts, no storms, adoption |
+| `SupervisorTests` | Backoff, per-peer health, per-tunnel restarts, no storms, adoption |
 | `HelperEngineTests` | Argv and file hygiene, boundary validation, DNS lifecycle, crash and boot recovery, install protocol |
+| `HelperLifecycleTests` | Teardown barrier, start verification, journal crash points, DNS retry and pending services, install staging race, smoke manifest |
 
-The app target and `Installer`, `ProcessRunner` and `Daemon` have no unit tests: they are thin OS
-adapters that need a real Mac.
+The app target and `Installer`, `ProcessRunner` and `Daemon` have no unit tests: they are OS adapters that
+need a real Mac. The lifecycle tests replace only the commands; real `wg-quick` timing is proved by the
+helper smoke below.
+
+## Authenticated helper proof
+
+`WIRENEST_HELPER_SMOKE=1 WireNestApp --helper-smoke /absolute/manifest.json` is an off-by-default CI
+diagnostic. It uses the production `HelperClient` and so the real XPC pin and engine, and never touches
+saved state. It loads a manifest of exactly two tunnels whose 0600 configs stay inside `198.18.0.0/15` with
+127.0.0.1 endpoints and no DNS, hooks or default routes, and refuses to run if the helper already owns
+tunnels or DNS.
+
+It starts both tunnels and probes both at once over real TCP for an exact token, and checks peer handshakes
+and counters. It then restarts only A `restartCount` times (1 to 5). After each `down`, B must keep its utun
+and answer with moving counters, and A must not answer. After each `up`, both must answer. After `downAll`
+the helper must own nothing. It prints `HELPER_SMOKE_PASSED` and exits 0 only after all of that; anything
+else exits nonzero with a key-free message and takes down what it started. Overall time is bounded by the
+harness. `scripts/smoke-helper.sh` owns the fixtures, peers, install and uninstall.
 
 ## Needs real-Mac verification
 
@@ -231,10 +299,10 @@ These rest on documentation or reasoning, not on execution:
 
 1. `setConnectionCodeSigningRequirement` with a `cdhash` requirement accepts an ad-hoc signed client.
 2. The whole install path: AppleScript prompt, `--install`, launchd bootstrap, first XPC call.
-3. wg-quick behavior under launchd. `detect_launchd` may make `up` block in `wait` inside a daemon, so
-   `ProcessRunner` treats the "Backgrounding route monitor" output as ready and keeps the process.
-4. `wg show` on the real `utunN` name, and tunnel survival across a helper restart via
-   `AbandonProcessGroup`.
+3. wg-quick behavior under launchd, where `detect_launchd` may make `up` block in `wait`, and the
+   monitor keeping the exact argv that `ProcessRunner` matches after it forks.
+4. Real teardown order and timing within the 20 second limit, `wg show` on the real `utunN` name,
+   and tunnel survival across a helper restart.
 5. The Location prompt from an `LSUIElement` app, and `SMAppService.mainApp` with an ad-hoc signature.
 6. `requiredInterface` actually bypassing `wg-quick`'s split default routes.
 7. The UI's look, layout and behavior: none of it has been seen on screen.

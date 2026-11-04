@@ -14,6 +14,7 @@ public enum HelperConstants {
     public static let toolNames = ["bash", "wg", "wg-quick", "wireguard-go"]
     public static let maxRequestBytes = 256 * 1024
     public static let maxTunnels = 16
+    public static let slotNames = (0..<maxTunnels).map { "wn\($0)" }
 }
 
 /// One bounded entry point: requests are data, decoded and validated by the helper. There is no way to name a command.
@@ -69,6 +70,8 @@ public struct HelperStatus: Codable, Equatable {
     public let protocolVersion: Int
     public let tunnels: [HelperTunnelStatus]
     public let dnsManaged: Bool
+    /// Network services whose original DNS servers still wait to be restored.
+    public let dnsPendingServices: [String]
 }
 
 public struct HelperResponse: Codable, Equatable {

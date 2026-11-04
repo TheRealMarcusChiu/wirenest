@@ -109,6 +109,135 @@ final class HealthTrackerTests: XCTestCase {
     }
 }
 
+final class MultiPeerHealthTests: XCTestCase {
+    private let t0 = Date(timeIntervalSince1970: 2_500_000)
+    private var old: Date { t0.addingTimeInterval(-3600) }
+
+    private func status(_ peers: [PeerStats]) -> HelperTunnelStatus {
+        HelperTunnelStatus(tunnelID: UUID(), interface: "utun7", fingerprint: "f", alive: true, peers: peers)
+    }
+
+    private func peer(_ key: String, handshake: Date?, rx: UInt64 = 0, tx: UInt64 = 0) -> PeerStats {
+        PeerStats(publicKey: key, latestHandshake: handshake, rxBytes: rx, txBytes: tx)
+    }
+
+    /// Peer A stays fresh and busy for the whole run while peer B sends into the void.
+    private func runHealthyAPlusStalledB(from start: Double = 40, through end: Double, tracker: inout HealthTracker) -> HealthVerdict? {
+        var verdict: HealthVerdict?
+        for offset in stride(from: start, through: end, by: 10) {
+            let now = t0.addingTimeInterval(offset)
+            verdict = tracker.update(status([
+                peer("A", handshake: now, rx: UInt64(offset) * 100, tx: UInt64(offset) * 100),
+                peer("B", handshake: old, rx: 5, tx: UInt64(offset) * 100),
+            ]), now: now)
+        }
+        return verdict
+    }
+
+    func testFreshActivePeerDoesNotConcealAStalledPeer() {
+        var tracker = HealthTracker(now: t0)
+        XCTAssertEqual(runHealthyAPlusStalledB(through: 100, tracker: &tracker)?.state, .degraded)
+
+        var later = HealthTracker(now: t0)
+        let verdict = runHealthyAPlusStalledB(through: 240, tracker: &later)
+        XCTAssertEqual(verdict?.state, .degraded)
+        XCTAssertEqual(verdict?.shouldRestart, true)
+    }
+
+    func testAnotherPeersReceiveDoesNotClearTheStall() {
+        var tracker = HealthTracker(now: t0)
+        var verdict: HealthVerdict?
+        for offset in stride(from: 40.0, through: 240, by: 10) {
+            verdict = tracker.update(status([
+                peer("A", handshake: old, rx: UInt64(offset) * 100, tx: 7),
+                peer("B", handshake: old, rx: 5, tx: UInt64(offset) * 100),
+            ]), now: t0.addingTimeInterval(offset))
+        }
+        XCTAssertEqual(verdict?.shouldRestart, true)
+    }
+
+    func testStalledPeerRecoversByItsOwnReply() {
+        var tracker = HealthTracker(now: t0)
+        _ = runHealthyAPlusStalledB(through: 100, tracker: &tracker)
+        let now = t0.addingTimeInterval(110)
+        let verdict = tracker.update(status([
+            peer("A", handshake: now, rx: 50_000, tx: 50_000),
+            peer("B", handshake: old, rx: 90, tx: 50_000),
+        ]), now: now)
+        XCTAssertEqual(verdict.state, .connected)
+    }
+
+    func testIdlePeerWithOldHandshakeIsExemptOnItsOwn() {
+        var tracker = HealthTracker(now: t0)
+        var verdict: HealthVerdict?
+        for offset in stride(from: 40.0, through: 1000, by: 40) {
+            let now = t0.addingTimeInterval(offset)
+            verdict = tracker.update(status([
+                peer("A", handshake: now, rx: UInt64(offset), tx: UInt64(offset)),
+                peer("B", handshake: old, rx: 5, tx: 5),
+            ]), now: now)
+            XCTAssertFalse(verdict!.shouldRestart)
+        }
+        XCTAssertEqual(verdict?.state, .connected)
+    }
+
+    func testIdlePeerThatNeverHandshakedIsNotGreenAndNeverRestarts() {
+        var tracker = HealthTracker(now: t0)
+        var verdict: HealthVerdict?
+        for offset in stride(from: 40.0, through: 1000, by: 40) {
+            let now = t0.addingTimeInterval(offset)
+            verdict = tracker.update(status([
+                peer("A", handshake: now, rx: UInt64(offset), tx: UInt64(offset)),
+                peer("B", handshake: nil),
+            ]), now: now)
+            XCTAssertFalse(verdict!.shouldRestart)
+            XCTAssertNil(tracker.healthySince, "not a genuinely healthy aggregate")
+        }
+        XCTAssertEqual(verdict?.state, .connecting)
+    }
+
+    func testPeerRemovedFromTheListNoLongerCounts() {
+        var tracker = HealthTracker(now: t0)
+        _ = runHealthyAPlusStalledB(through: 100, tracker: &tracker)
+        let now = t0.addingTimeInterval(110)
+        XCTAssertEqual(tracker.update(status([peer("A", handshake: now, rx: 90_000, tx: 90_000)]), now: now).state, .connected)
+    }
+
+    func testNewPeerGetsABaselineSoExistingBytesAreNotGrowth() {
+        var tracker = HealthTracker(now: t0)
+        _ = tracker.update(status([peer("A", handshake: t0, rx: 1, tx: 1)]), now: t0.addingTimeInterval(40))
+        let verdict = tracker.update(status([
+            peer("A", handshake: t0.addingTimeInterval(50), rx: 2, tx: 2),
+            peer("B", handshake: old, rx: 0, tx: 1_000_000),
+        ]), now: t0.addingTimeInterval(50))
+        XCTAssertEqual(verdict.state, .connected)
+    }
+
+    func testCounterResetIsNeitherGrowthNorRecovery() {
+        var tracker = HealthTracker(now: t0)
+        _ = tracker.update(status([peer("B", handshake: old, rx: 500, tx: 500)]), now: t0.addingTimeInterval(40))
+        let verdict = tracker.update(status([peer("B", handshake: old, rx: 1, tx: 1)]), now: t0.addingTimeInterval(50))
+        XCTAssertEqual(verdict.state, .connected, "idle")
+        let next = tracker.update(status([peer("B", handshake: old, rx: 1, tx: 1)]), now: t0.addingTimeInterval(60))
+        XCTAssertFalse(next.shouldRestart)
+    }
+
+    func testBackoffResetWaitsForEveryPeerToBeHealthy() {
+        let id = UUID()
+        func running(_ peers: [PeerStats]) -> HelperTunnelStatus {
+            HelperTunnelStatus(tunnelID: id, interface: "utun1", fingerprint: "f", alive: true, peers: peers)
+        }
+        var tracker = HealthTracker(now: t0)
+        let now = t0.addingTimeInterval(40)
+        _ = tracker.update(running([peer("A", handshake: now), peer("B", handshake: old, rx: 1, tx: 1)]), now: now)
+        XCTAssertNotNil(tracker.healthySince, "fresh plus genuinely idle is healthy")
+
+        let stalled = t0.addingTimeInterval(50)
+        _ = tracker.update(running([peer("A", handshake: stalled), peer("B", handshake: old, rx: 1, tx: 500)]), now: stalled)
+        XCTAssertNil(tracker.healthySince)
+    }
+}
+
 final class TunnelSupervisorTests: XCTestCase {
     private let t0 = Date(timeIntervalSince1970: 3_000_000)
     private let a = UUID(), b = UUID()

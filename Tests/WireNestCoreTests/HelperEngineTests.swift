@@ -3,9 +3,30 @@ import XCTest
 
 /// Stands in for the real binaries only at the subprocess edge; everything above it is production code.
 final class FakeCommands: CommandRunning {
+    /// What wg-quick left running for one `wnN` name. Teardown follows the real order: the socket
+    /// goes first, then wireguard-go and the utun, and the route monitor notices last.
+    struct Slot {
+        var real: String
+        var pgid: Int32
+        var wgReachable = true
+        var monitorAlive = true
+        var pausesUntilGone: Int?
+    }
+
     var calls: [(executable: String, args: [String])] = []
     var failUp = false
     var failDown = false
+    /// Prints the ready marker and exits 0 with nothing actually running.
+    var upMarkerOnly = false
+    var upWithoutMonitor = false
+    /// `wg-quick down` exits 0 but the device keeps answering.
+    var downLeavesDeviceAlive = false
+    var monitorExitPauses = 0
+    var monitorIgnoresTerm = false
+    var onQuick: ((String) -> Void)?
+    var slots: [String: Slot] = [:]
+    var terminatedGroups: [Int32] = []
+    var pauses = 0
     var dns: [String: [String]] = ["Wi-Fi": ["192.168.1.1"], "Ethernet": []]
     var failSetDNS = false
     var disabledServices: [String] = []
@@ -14,34 +35,76 @@ final class FakeCommands: CommandRunning {
 
     init(paths: HelperPaths) { self.paths = paths }
 
+    func liveProcessGroups(matching argv: [String]) -> [Int32] {
+        guard argv.count == 4, argv[0] == paths.bash, argv[1] == paths.wgQuick, argv[2] == "up" else { return [] }
+        let name = URL(fileURLWithPath: argv[3]).deletingPathExtension().lastPathComponent
+        return slots[name].flatMap { $0.monitorAlive ? [$0.pgid] : [] } ?? []
+    }
+
+    func terminateProcessGroup(_ pgid: Int32) {
+        terminatedGroups.append(pgid)
+        guard !monitorIgnoresTerm, let name = slots.first(where: { $0.value.pgid == pgid })?.key else { return }
+        slots[name]?.monitorAlive = false
+        if slots[name]?.wgReachable == false { slots[name] = nil }
+    }
+
+    func pause(_ seconds: TimeInterval) {
+        pauses += 1
+        for name in slots.keys {
+            guard let remaining = slots[name]?.pausesUntilGone else { continue }
+            slots[name]?.pausesUntilGone = remaining - 1
+            if remaining <= 1 { slots[name] = nil }
+        }
+    }
+
     func run(_ executable: String, _ args: [String], timeout: TimeInterval, readyMarker: String?) -> CommandResult {
         calls.append((executable, args))
         if executable == paths.bash {
             let action = args[1], conf = args[2]
             let name = URL(fileURLWithPath: conf).deletingPathExtension().lastPathComponent
             let nameFile = paths.wireguardRunDir.appendingPathComponent("\(name).name")
+            onQuick?(action)
             if action == "up" {
                 if failUp { return CommandResult(status: 1, output: "wg setconf failed for \(testKey(1))") }
+                if upMarkerOnly { return CommandResult(status: 0, output: "[+] Backgrounding route monitor") }
                 try? FileManager.default.createDirectory(at: paths.wireguardRunDir, withIntermediateDirectories: true)
-                try? "utun\(nextUtun)\n".write(to: nameFile, atomically: true, encoding: .utf8)
+                let real = "utun\(nextUtun)"
+                try? "\(real)\n".write(to: nameFile, atomically: true, encoding: .utf8)
+                try? Data().write(to: paths.wireguardRunDir.appendingPathComponent("\(real).sock"))
+                slots[name] = Slot(real: real, pgid: 1000 + Int32(nextUtun), monitorAlive: !upWithoutMonitor)
                 nextUtun += 1
                 return CommandResult(status: 0, output: "[+] Backgrounding route monitor")
             }
             if failDown { return CommandResult(status: 1, output: "cannot remove") }
+            guard let slot = slots[name] else { return CommandResult(status: 1, output: "not a WireGuard interface") }
             try? FileManager.default.removeItem(at: nameFile)
+            try? FileManager.default.removeItem(at: paths.wireguardRunDir.appendingPathComponent("\(slot.real).sock"))
+            if downLeavesDeviceAlive { return CommandResult(status: 0, output: "") }
+            slots[name]?.wgReachable = false
+            if monitorExitPauses == 0 {
+                slots[name] = nil
+            } else {
+                slots[name]?.pausesUntilGone = monitorExitPauses
+            }
             return CommandResult(status: 0, output: "")
         }
         if executable == paths.wg {
+            guard slots.values.contains(where: { $0.real == args[1] && $0.wgReachable }) else {
+                return CommandResult(status: 1, output: "Unable to access interface")
+            }
             switch args.last {
             case "latest-handshakes": return CommandResult(status: 0, output: "\(testKey(2))\t1700000000\n")
             case "transfer": return CommandResult(status: 0, output: "\(testKey(2))\t11\t22\n")
             default: return CommandResult(status: 1, output: "")
             }
         }
+        if executable == "/sbin/ifconfig" {
+            return CommandResult(status: slots.values.contains { $0.real == args[0] } ? 0 : 1, output: "")
+        }
         if executable == "/usr/sbin/networksetup" {
             switch args[0] {
             case "-listallnetworkservices":
-                let enabled = dns.keys.sorted().joined(separator: "\n")
+                let enabled = dns.keys.filter { !disabledServices.contains($0) }.sorted().joined(separator: "\n")
                 let disabled = disabledServices.map { "*" + $0 }.joined(separator: "\n")
                 return CommandResult(status: 0, output: "An asterisk (*) denotes that a network service is disabled.\n\(enabled)\n\(disabled)\n")
             case "-getdnsservers":
@@ -49,7 +112,7 @@ final class FakeCommands: CommandRunning {
                 let text = servers.isEmpty ? "There aren't any DNS Servers set on \(args[1]).\n" : servers.joined(separator: "\n") + "\n"
                 return CommandResult(status: 0, output: text)
             case "-setdnsservers":
-                if failSetDNS { return CommandResult(status: 1, output: "nope") }
+                if failSetDNS || disabledServices.contains(args[1]) { return CommandResult(status: 1, output: "nope") }
                 dns[args[1]] = args[2] == "Empty" ? [] : Array(args[2...])
                 return CommandResult(status: 0, output: "")
             default: break

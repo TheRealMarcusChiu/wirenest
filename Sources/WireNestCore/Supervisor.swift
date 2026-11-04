@@ -33,9 +33,17 @@ public struct HealthVerdict: Equatable {
     public let shouldRestart: Bool
 }
 
-/// Judges a tunnel from real counters. An old handshake alone is never a failure, because
-/// WireGuard only handshakes when there is traffic. A failure is outbound bytes with no reply.
+/// Judges a tunnel from real counters, peer by peer. An old handshake alone is never a failure,
+/// because WireGuard only handshakes when there is traffic. A failure is outbound bytes with no reply
+/// from that same peer, so one healthy peer can never hide another that has stalled.
 public struct HealthTracker: Equatable {
+    private struct PeerTrack: Equatable {
+        var rx: UInt64
+        var tx: UInt64
+        var stallSince: Date?
+        var lastTxGrowth: Date?
+    }
+
     /// WireGuard's REJECT_AFTER_TIME: a session older than this cannot carry data.
     static let handshakeFresh: TimeInterval = 180
     static let grace: TimeInterval = 30
@@ -44,10 +52,7 @@ public struct HealthTracker: Equatable {
     static let txQuietClearsStall: TimeInterval = 120
 
     private var graceUntil: Date
-    private var stallSince: Date?
-    private var lastRx: UInt64?
-    private var lastTx: UInt64?
-    private var lastTxGrowth: Date?
+    private var tracks: [String: PeerTrack] = [:]
     private(set) var healthySince: Date?
 
     public init(now: Date) {
@@ -56,7 +61,7 @@ public struct HealthTracker: Equatable {
 
     /// Sleep, wake or a path change: counters mean little for a moment, so wait instead of restarting.
     public mutating func noteNetworkEvent(now: Date) {
-        stallSince = nil
+        for key in tracks.keys { tracks[key]?.stallSince = nil }
         graceUntil = now.addingTimeInterval(Self.grace)
     }
 
@@ -66,44 +71,55 @@ public struct HealthTracker: Equatable {
             return HealthVerdict(state: .disconnected, detail: "Interface is gone", shouldRestart: true)
         }
 
-        let rx = status.peers.reduce(UInt64(0)) { $0 &+ $1.rxBytes }
-        let tx = status.peers.reduce(UInt64(0)) { $0 &+ $1.txBytes }
-        let rxGrew = lastRx.map { rx > $0 } ?? false
-        let txGrew = lastTx.map { tx > $0 } ?? false
-        lastRx = rx
-        lastTx = tx
-        if txGrew { lastTxGrowth = now }
-
-        let handshake = status.peers.compactMap(\.latestHandshake).max()
-        if let handshake, now.timeIntervalSince(handshake) < Self.handshakeFresh {
-            stallSince = nil
-            healthySince = healthySince ?? now
-            return HealthVerdict(state: .connected, detail: "Handshake \(Int(now.timeIntervalSince(handshake)))s ago", shouldRestart: false)
-        }
-        healthySince = nil
-
         let inGrace = now < graceUntil
-        if rxGrew || inGrace {
-            stallSince = nil
-        } else if txGrew {
-            stallSince = stallSince ?? now
-        } else if let lastTxGrowth, now.timeIntervalSince(lastTxGrowth) > Self.txQuietClearsStall {
-            stallSince = nil
+        var updated: [String: PeerTrack] = [:]
+        var longestStall: TimeInterval?
+        var anyFresh = false
+        var anyAwaitingFirstHandshake = false
+        for peer in status.peers {
+            // A new peer, or a counter that went backwards, gets a baseline: its bytes say nothing yet.
+            let previous = tracks[peer.publicKey].flatMap { $0.rx <= peer.rxBytes && $0.tx <= peer.txBytes ? $0 : nil }
+            var track = previous ?? PeerTrack(rx: peer.rxBytes, tx: peer.txBytes)
+            let rxGrew = peer.rxBytes > track.rx
+            let txGrew = peer.txBytes > track.tx
+            track.rx = peer.rxBytes
+            track.tx = peer.txBytes
+            if txGrew { track.lastTxGrowth = now }
+
+            let fresh = peer.latestHandshake.map { now.timeIntervalSince($0) < Self.handshakeFresh } ?? false
+            if fresh || rxGrew || inGrace {
+                track.stallSince = nil
+            } else if txGrew {
+                track.stallSince = track.stallSince ?? now
+            } else if let growth = track.lastTxGrowth, now.timeIntervalSince(growth) > Self.txQuietClearsStall {
+                track.stallSince = nil
+            }
+            if let since = track.stallSince { longestStall = max(longestStall ?? 0, now.timeIntervalSince(since)) }
+            anyFresh = anyFresh || fresh
+            anyAwaitingFirstHandshake = anyAwaitingFirstHandshake || peer.latestHandshake == nil
+            updated[peer.publicKey] = track
+        }
+        tracks = updated
+
+        if anyFresh, longestStall == nil, !anyAwaitingFirstHandshake {
+            healthySince = healthySince ?? now
+        } else {
+            healthySince = nil
         }
 
-        if let stallSince {
-            let stalled = now.timeIntervalSince(stallSince)
-            if stalled >= Self.stallRestart {
-                return HealthVerdict(state: .degraded, detail: "No reply for \(Int(stalled))s, reconnecting", shouldRestart: true)
+        if let longestStall {
+            if longestStall >= Self.stallRestart {
+                return HealthVerdict(state: .degraded, detail: "A peer has not replied for \(Int(longestStall))s, reconnecting", shouldRestart: true)
             }
-            if stalled >= Self.stallDegraded {
-                return HealthVerdict(state: .degraded, detail: "Sending but no reply for \(Int(stalled))s", shouldRestart: false)
+            if longestStall >= Self.stallDegraded {
+                return HealthVerdict(state: .degraded, detail: "Sending to a peer with no reply for \(Int(longestStall))s", shouldRestart: false)
             }
         }
-        guard let handshake else {
-            return HealthVerdict(state: .connecting, detail: "Waiting for first handshake", shouldRestart: false)
+        guard !anyAwaitingFirstHandshake, let handshake = status.peers.compactMap(\.latestHandshake).max() else {
+            return HealthVerdict(state: .connecting, detail: "Waiting for a first handshake", shouldRestart: false)
         }
-        return HealthVerdict(state: .connected, detail: "Idle, last handshake \(Int(now.timeIntervalSince(handshake)))s ago", shouldRestart: false)
+        let age = Int(now.timeIntervalSince(handshake))
+        return HealthVerdict(state: .connected, detail: anyFresh ? "Handshake \(age)s ago" : "Idle, last handshake \(age)s ago", shouldRestart: false)
     }
 }
 
