@@ -72,9 +72,9 @@ These results come from [CI run 41753758485](https://github.com/TheRealMarcusChi
 | DMG integrity, mounting, and auditing the app inside | Yes | **Yes** |
 | App and helper binaries load from the DMG | Yes | **Load only:** the app stayed running for 8 seconds, and the helper ran with `--help` |
 | Two simultaneous tunnels with TCP traffic, using the bundled tools directly, with one stopped independently and default route and DNS unchanged | Yes | **Yes**, without the app or helper |
-| App and helper running a tunnel together | Yes, fixes pending | **No** |
-| Root helper installation and IPC | Yes, fixes pending | **No** |
-| Helper caller authentication, including any code-identity check | Yes, fixes pending | **No:** the `--help` launch doesn't exercise it |
+| App and helper running a tunnel together | Yes, fixes pending | **No:** proof configured, not yet run |
+| Root helper installation and IPC | Yes, fixes pending | **No:** proof configured, not yet run |
+| Helper caller authentication, including any code-identity check | Yes, fixes pending | **No:** the `--help` launch doesn't exercise it, and the proof hasn't run |
 | WireNest's DNS changes and restoration | Yes, fixes pending | **No:** the smoke test only confirms that DNS stays untouched |
 | Failure recovery and sleep/wake handling | Yes, fixes pending | **No** |
 | Menu-bar UI | Yes | **No** |
@@ -82,3 +82,11 @@ These results come from [CI run 41753758485](https://github.com/TheRealMarcusChi
 | Start at login | Yes | **No** |
 
 Also untested: real VPN servers, physical Mac hardware, macOS 13 and 14, and Gatekeeper's first-launch flow.
+
+### Root helper proof
+
+CI is configured to run `scripts/smoke-helper.sh` on both architectures after the two-tunnel test. It's meant to drive the signed app's real helper client over the authenticated connection to install the root helper, start two tunnels, restart one while the other keeps working, and tear everything down.
+
+**It hasn't run or passed yet**, and an app without the pending root helper fixes is expected to fail it. It runs only on disposable CI machines and is not an install method.
+
+Even once it passes, it won't cover the menu-bar UI, Wi-Fi rules, start at login, sleep/wake, or WireNest changing DNS. It can't show that the whole app is ready for production use.

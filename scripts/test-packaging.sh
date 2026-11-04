@@ -92,7 +92,7 @@ else
   fail "complete source listing rejected"
 fi
 for missing in README-SOURCES.md SOURCE-REVISION.txt scripts/build-tools.sh scripts/build-app.sh scripts/deps.sh \
-  scripts/make-dmg.sh upstream/bash53-020 "upstream/wireguard-tools-$WG_TOOLS_VERSION.tar.xz"; do
+  scripts/make-dmg.sh scripts/smoke-helper.sh upstream/bash53-020 "upstream/wireguard-tools-$WG_TOOLS_VERSION.tar.xz"; do
   grep -Fxv "$SOURCE_PREFIX/$missing" "$scratch/listing" >"$scratch/listing.short" || true
   if check_source_listing "$scratch/listing.short" 2>/dev/null; then
     fail "source listing accepted without $missing"
@@ -121,6 +121,30 @@ fi
 # Third-party actions run with the repository's token, so tags are not acceptable pins.
 unpinned=$(grep -hE '^\s*(- )?uses:' .github/workflows/*.yml | grep -vE 'uses: *(\./|[^@]+@[0-9a-f]{40}( |$))' || true)
 [[ -z $unpinned ]] && pass "workflow actions pinned to commits" || fail "unpinned actions: $unpinned"
+
+# The helper proof is an acceptance gate: exact unprivileged command, bounded, after the
+# direct smoke test, with nothing able to hide its failure or widen the job's access.
+helper_run='run: bash scripts/smoke-helper.sh .build/packaging/from-dmg/WireNest.app .build/packaging/smoke-peer'
+helper_step_is_gated() {
+  local workflow=$1 direct helper
+  direct=$(grep -nF 'run: sudo bash scripts/smoke-two-tunnels.sh' "$workflow" | cut -d: -f1 || true)
+  helper=$(grep -nFx "        $helper_run" "$workflow" | cut -d: -f1 || true)
+  [[ -n $direct && -n $helper && $helper -gt $direct ]] &&
+    [[ $(sed -n "$((helper - 1))p" "$workflow") == '        timeout-minutes: 10' ]] &&
+    ! grep -Eq 'continue-on-error|\|\| *true|contents: write|secrets\.' "$workflow"
+}
+workflow=.github/workflows/macos.yml
+helper_step_is_gated "$workflow" && pass "helper proof is gated in CI" || fail "helper proof step is missing or weakened"
+sed 's#run: bash scripts/smoke-helper#run: sudo bash scripts/smoke-helper#' "$workflow" >"$scratch/sudo.yml"
+{ cat "$workflow"; echo '        continue-on-error: true'; } >"$scratch/soft.yml"
+sed 's#^\( *\)timeout-minutes: 10$#\1timeout-minutes: 30#' "$workflow" >"$scratch/slow.yml"
+{ echo '        timeout-minutes: 10'; echo "        $helper_run"; grep -Fv "$helper_run" "$workflow"; } >"$scratch/early.yml"
+for variant in sudo soft slow early; do
+  helper_step_is_gated "$scratch/$variant.yml" && fail "helper gate accepted the $variant variant" || pass "helper gate rejected the $variant variant"
+done
+
+# Blocked until lane C's script is integrated: CI would otherwise fail much later on a Mac.
+[[ -f scripts/smoke-helper.sh ]] && pass "scripts/smoke-helper.sh present" || fail "scripts/smoke-helper.sh is missing from this checkout"
 
 [[ $fails -eq 0 ]] || die "$fails check(s) failed"
 echo "All packaging self-checks passed."

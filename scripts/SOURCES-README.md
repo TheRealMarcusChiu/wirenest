@@ -34,6 +34,10 @@ bash scripts/verify-dmg.sh "dist/WireNest-0.1.0-$(uname -m).dmg" "$(uname -m)"
 
 Replace `0.1.0` with the version you are building.
 
+## CI-only tests
+
+`scripts/smoke-two-tunnels.sh` and `scripts/smoke-helper.sh` are included because the release's CI runs them, but you don't need them to rebuild. `scripts/smoke-helper.sh` installs and removes a root helper, and it only runs on disposable CI machines. It is not a way to install WireNest.
+
 ## What is downloaded during a rebuild
 
 The `upstream/` files are reused without downloading them again. `build-tools.sh` still needs network access for two things, neither of them GPL-licensed:

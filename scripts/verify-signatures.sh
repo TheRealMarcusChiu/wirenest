@@ -35,7 +35,7 @@ required_source_files() {
   local entry
   printf '%s\n' README-SOURCES.md SOURCE-REVISION.txt LICENSE Package.swift THIRD_PARTY_NOTICES.md \
     scripts/deps.sh scripts/build-tools.sh scripts/build-app.sh scripts/audit-app.sh \
-    scripts/make-dmg.sh scripts/verify-dmg.sh scripts/smoke-two-tunnels.sh \
+    scripts/make-dmg.sh scripts/verify-dmg.sh scripts/smoke-two-tunnels.sh scripts/smoke-helper.sh \
     scripts/smoke-peer/main.go scripts/WireNest.entitlements \
     "upstream/bash-$BASH_PIN_VERSION.tar.gz" \
     "upstream/wireguard-tools-$WG_TOOLS_VERSION.tar.xz" \

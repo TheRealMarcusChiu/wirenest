@@ -85,3 +85,8 @@ jobs:
       # A failure here still fails the run, and release.yml then publishes nothing.
       - name: Real two-tunnel smoke test
         run: sudo bash scripts/smoke-two-tunnels.sh .build/packaging/from-dmg/WireNest.app .build/packaging/smoke-peer
+      # Not under sudo: the driver must have the same owner UID as the signed app, and the
+      # script itself uses sudo only to install and uninstall the helper.
+      - name: Real app-to-root-helper smoke test
+        timeout-minutes: 10
+        run: bash scripts/smoke-helper.sh .build/packaging/from-dmg/WireNest.app .build/packaging/smoke-peer

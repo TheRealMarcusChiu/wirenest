@@ -64,6 +64,8 @@ WireGuard tunnels need root to create network interfaces and change routes, so W
 
 That test uses the bundled `bash`, `wg`, `wg-quick`, and `wireguard-go` directly, without the app or helper. It starts two tunnels with throwaway keys to peers on the same machine, sends TCP traffic through each, stops one while the other keeps working, and confirms that the default route and DNS didn't change.
 
+A second CI test, `scripts/smoke-helper.sh`, is meant to cover the path from the app through its authenticated connection to the root helper: installing the helper, then starting, restarting, and stopping tunnels. **It's configured but hasn't run or passed yet.** It's waiting on the pending root helper security, DNS, and health fixes. Even once it passes, it won't cover the menu-bar UI, Wi-Fi rules, start at login, sleep/wake, or WireNest changing DNS.
+
 **Not tested yet:**
 
 - The app and helper running a tunnel together
