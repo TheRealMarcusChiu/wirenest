@@ -65,12 +65,12 @@ public struct HelperSmokeManifest {
         cidr.prefix >= reservedRange.prefix && reservedRange.overlaps(cidr)
     }
 
-    private static func problem(_ message: String) -> SecureFileError {
+    static func problem(_ message: String) -> SecureFileError {
         SecureFileError("Invalid smoke manifest: \(message)")
     }
 
     /// Absolute, a regular file, owned by this user. Configs hold private keys, so they must also be unreadable to others.
-    private static func readPrivateFile(_ path: String, requirePrivate: Bool) throws -> Data {
+    static func readPrivateFile(_ path: String, requirePrivate: Bool) throws -> Data {
         var info = stat()
         guard path.hasPrefix("/"), lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_uid == geteuid(),
               !requirePrivate || info.st_mode & 0o077 == 0 else {

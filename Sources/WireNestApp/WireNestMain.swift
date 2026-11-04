@@ -37,6 +37,9 @@ struct WireNestMain: App {
             print("WireNest protocol \(HelperConstants.protocolVersion)")
             exit(0)
         }
+        if CommandLine.arguments.contains("--helper-full-route-smoke") {
+            HelperSmoke.runFullRouteAndExit(arguments: Array(CommandLine.arguments.dropFirst()))
+        }
         if CommandLine.arguments.contains("--helper-smoke") {
             HelperSmoke.runAndExit(arguments: Array(CommandLine.arguments.dropFirst()))
         }

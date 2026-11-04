@@ -326,6 +326,7 @@ act on it. Other changes to saved state from a rule are committed only with a su
 | `SupervisorTests` | Backoff, per-peer health, per-tunnel restarts, no storms, adoption |
 | `HelperEngineTests` | Argv and file hygiene, boundary validation, DNS lifecycle, crash and boot recovery, install protocol |
 | `EndpointRouteProofTests` | Assessment of the full-plus-narrow pair, replay of observed Darwin output with labelled synthetic mutations, read-only real commands, root preflight, postflight, loss of proof and recovery |
+| `HelperFullRouteManifestTests` | The separate full-route manifest's exact values, CI opt-in, and the original manifest still refusing this shape |
 | `HelperLifecycleTests` | Teardown barrier, start verification, journal crash points, DNS retry and pending services, install staging race, smoke manifest |
 
 The app target and `Installer`, `ProcessRunner` and `Daemon` have no unit tests: they are OS adapters that
@@ -346,6 +347,26 @@ and answer with moving counters, and A must not answer. After each `up`, both mu
 the helper must own nothing. It prints `HELPER_SMOKE_PASSED` and exits 0 only after all of that; anything
 else exits nonzero with a key-free message and takes down what it started. Overall time is bounded by the
 harness. `scripts/smoke-helper.sh` owns the fixtures, peers, install and uninstall.
+
+## Full-route proof
+
+`WireNestApp --helper-full-route-smoke /absolute/manifest.json` exercises a real IPv4 default route through the
+same production `HelperClient`, XPC pin and root engine. It is separate from `--helper-smoke`, which keeps refusing
+default routes. It runs only with `WIRENEST_FULL_ROUTE_SMOKE=1`, `GITHUB_ACTIONS=true` and
+`RUNNER_ENVIRONMENT=github-hosted`, and otherwise exits nonzero before any UI, profile or XPC use. The manifest
+is validated against exact values: a full tunnel `198.18.71.1/32`, `0.0.0.0/0`, endpoint `127.77.0.2` and probe
+`198.18.71.2`, and a split tunnel `198.18.72.1/32`, `198.18.72.0/24`, endpoint `127.77.0.3` and probe `198.18.72.2`,
+with `restartCount` 1 and `startupOrder` `split-first` or `full-first`.
+
+One run starts and ends with no tunnels: first tunnel up and proven, second up and both proven, second stopped
+with the first keeping its interface and proven again, first stopped. Readiness is judged from this ordinary
+process, not from root: both `/1` rows on the full tunnel's interface, no narrower installed route to its probe,
+lookups of both halves, and the exact `/24` on the split tunnel. Each checkpoint opens fresh unbound TCP connections,
+requires the exact token, and requires a real handshake with sent and received counters both growing from that
+checkpoint's own baseline. `FULL_ROUTE_SMOKE_PASSED <order>` prints only after the last stop is verified.
+
+The harness owns the rest and must never run on a personal Mac: the aliases, peers, independent root watchdog and
+network restoration. This driver has not been run anywhere yet.
 
 ## Needs real-Mac verification
 

@@ -16,12 +16,12 @@ public enum EndpointRouteProof {
         )
     }
 
-    static func readRoutingTable(_ runner: CommandRunning) -> CommandResult {
+    public static func readRoutingTable(_ runner: CommandRunning) -> CommandResult {
         runner.run("/usr/sbin/netstat", ["-rn", "-f", "inet"], timeout: 5, readyMarker: nil)
     }
 
     /// The interface an ordinary, unscoped lookup of this address uses, if the answer is well formed.
-    static func lookupInterface(_ address: String, runner: CommandRunning) -> String? {
+    public static func lookupInterface(_ address: String, runner: CommandRunning) -> String? {
         let result = runner.run("/sbin/route", ["-n", "get", "-inet", address], timeout: 5, readyMarker: nil)
         guard result.status == 0, let lookup = RouteLookup(result.output),
               lookup.flags.isDisjoint(with: ["REJECT", "BLACKHOLE"]) else { return nil }
@@ -100,6 +100,13 @@ extension EndpointRouteProof {
         return rows.contains {
             $0.network == wanted && $0.interface == interface && $0.flags.contains("U") && $0.flags.isDisjoint(with: Set("IBRW"))
         }
+    }
+
+    /// Whether anything installed other than the `/1` expansions or a default covers this address. A clone made by
+    /// traffic through those routes is not a route of its own. An unreadable table counts as yes.
+    public static func hasNarrowerRoute(netstat: String, to address: String) -> Bool {
+        guard let rows = parseRoutingTable(netstat), let value = ipv4Value(address) else { return true }
+        return rows.contains { $0.network.prefix >= 2 && $0.network.contains(value) && !$0.flags.contains("W") }
     }
 }
 

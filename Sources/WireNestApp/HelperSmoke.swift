@@ -148,6 +148,191 @@ enum HelperSmoke {
     }
 }
 
+/// `WireNestApp --helper-full-route-smoke MANIFEST`: the same production path as above, with a real IPv4 default route.
+/// It runs only in a hosted CI VM whose harness owns the fixtures and an independent network-recovery watchdog.
+/// Root's own readiness is not the oracle here: the kernel's table, lookups and real traffic are checked from this ordinary process.
+extension HelperSmoke {
+    /// Few enough to fit well inside the harness's 45 second default-route window.
+    private static let fullRouteProbeAttempts = 4
+
+    static func runFullRouteAndExit(arguments: [String]) -> Never {
+        guard arguments.count == 2, arguments[0] == "--helper-full-route-smoke",
+              fullRouteSmokeOptedIn(ProcessInfo.processInfo.environment) else {
+            fullRouteFail("--helper-full-route-smoke needs exactly one manifest path and the hosted CI opt-in environment.")
+        }
+        let path = arguments[1]
+        Task { @MainActor in
+            let client = HelperClient()
+            do {
+                let manifest = try HelperFullRouteManifest.load(path: path)
+                try await requireIdleHelper(client)
+                do {
+                    try await proveFullRoute(manifest, client: client)
+                } catch {
+                    _ = try? await client.send(.downAll, timeout: 40)
+                    throw error
+                }
+                print("FULL_ROUTE_SMOKE_PASSED \(manifest.order.rawValue)")
+                exit(0)
+            } catch {
+                fullRouteFail(error.localizedDescription)
+            }
+        }
+        dispatchMain()
+    }
+
+    private static func fullRouteFail(_ message: String) -> Never {
+        FileHandle.standardError.write(Data("FULL_ROUTE_SMOKE_FAILED: \(redactSecrets(message))\n".utf8))
+        exit(1)
+    }
+
+    private static func proveFullRoute(_ manifest: HelperFullRouteManifest, client: HelperClient) async throws {
+        let full = manifest.full, split = manifest.split
+        let first = manifest.order == .splitFirst ? split : full
+        let second = manifest.order == .splitFirst ? full : split
+
+        let firstInterface = try await bringUp(first, client: client)
+        try await verifyRoutes(fullInterface: first.id == full.id ? firstInterface : nil, splitInterface: first.id == split.id ? firstInterface : nil, full: full)
+        try await checkpoint([first], client: client)
+        print("First tunnel carries traffic.")
+
+        let secondInterface = try await bringUp(second, client: client)
+        guard secondInterface != firstInterface else { throw Failure("Both tunnels report the same interface.") }
+        guard try await liveInterface(first, client: client) == firstInterface else { throw Failure("Starting the second tunnel changed the first one's interface.") }
+        let fullInterface = first.id == full.id ? firstInterface : secondInterface
+        let splitInterface = first.id == split.id ? firstInterface : secondInterface
+        try await verifyRoutes(fullInterface: fullInterface, splitInterface: splitInterface, full: full)
+        try await checkpoint([full, split], client: client)
+        print("Both tunnels carry traffic on distinct interfaces.")
+
+        // The tunnel started second stops first, leaving the first one as the survivor in either order.
+        let afterStop = try await client.send(.down(tunnelID: second.id))
+        guard !afterStop.tunnels.contains(where: { $0.tunnelID == second.id }), afterStop.routeFailure == nil else {
+            throw Failure("The second tunnel did not stop cleanly.")
+        }
+        guard try await liveInterface(first, client: client) == firstInterface else { throw Failure("Stopping the second tunnel changed the survivor's interface.") }
+        try await verifyRoutes(fullInterface: first.id == full.id ? firstInterface : nil, splitInterface: first.id == split.id ? firstInterface : nil, full: full)
+        try verifyGone(second.id == full.id ? fullInterface : nil, splitInterface: second.id == split.id ? splitInterface : nil)
+        try await checkpoint([first], client: client)
+        print("The survivor kept its interface and carries traffic.")
+
+        let ended = try await client.send(.down(tunnelID: first.id))
+        guard ended.tunnels.isEmpty, !ended.dnsManaged, ended.routeFailure == nil else {
+            throw Failure("Tunnels, DNS management or a route failure remain after the last stop.")
+        }
+        try verifyGone(first.id == full.id ? fullInterface : nil, splitInterface: first.id == split.id ? splitInterface : nil)
+    }
+
+    private static func bringUp(_ tunnel: HelperSmokeManifest.Tunnel, client: HelperClient) async throws -> String {
+        let status = try await client.send(.up(tunnelID: tunnel.id, config: tunnel.configText))
+        guard status.routeFailure == nil else { throw Failure("The helper reports a route failure.") }
+        return try await liveInterface(tunnel, client: client)
+    }
+
+    private static func liveInterface(_ tunnel: HelperSmokeManifest.Tunnel, client: HelperClient) async throws -> String {
+        let status = try await client.send(.status)
+        guard status.routeFailure == nil else { throw Failure("The helper reports a route failure.") }
+        guard let live = status.tunnels.first(where: { $0.tunnelID == tunnel.id }), live.alive, !live.interface.isEmpty else {
+            throw Failure("The helper does not report the tunnel alive.")
+        }
+        return live.interface
+    }
+
+    /// Read from the kernel by this process. The lookups cover both `/1` halves and the probe itself, and only read the table.
+    private static func verifyRoutes(fullInterface: String?, splitInterface: String?, full: HelperSmokeManifest.Tunnel) async throws {
+        let commands = ReadOnlyCommands()
+        let table = EndpointRouteProof.readRoutingTable(commands)
+        guard table.status == 0 else { throw Failure("The routing table could not be read.") }
+        if let fullInterface {
+            guard EndpointRouteProof.defaultExpansionsInstalled(netstat: table.output, on: fullInterface) else {
+                throw Failure("Both default-route halves are not on the full tunnel's interface.")
+            }
+            guard !EndpointRouteProof.hasNarrowerRoute(netstat: table.output, to: full.probeHost) else {
+                throw Failure("A route narrower than the default expansion covers the full tunnel's probe.")
+            }
+            for address in ["64.0.0.1", full.probeHost] where EndpointRouteProof.lookupInterface(address, runner: commands) != fullInterface {
+                throw Failure("A lookup of \(address) does not select the full tunnel.")
+            }
+        }
+        if let splitInterface {
+            guard EndpointRouteProof.routeInstalled(netstat: table.output, address: "198.18.72.0", prefix: 24, on: splitInterface),
+                  EndpointRouteProof.lookupInterface("198.18.72.2", runner: commands) == splitInterface else {
+                throw Failure("The split tunnel's /24 is not in effect on its interface.")
+            }
+        }
+    }
+
+    private static func verifyGone(_ fullInterface: String?, splitInterface: String?) throws {
+        let table = EndpointRouteProof.readRoutingTable(ReadOnlyCommands())
+        guard table.status == 0 else { throw Failure("The routing table could not be read.") }
+        if let fullInterface, table.output.split(whereSeparator: \.isWhitespace).contains(where: { $0 == fullInterface }) {
+            throw Failure("The stopped full tunnel still has routes.")
+        }
+        if let splitInterface, EndpointRouteProof.routeInstalled(netstat: table.output, address: "198.18.72.0", prefix: 24, on: splitInterface) {
+            throw Failure("The stopped split tunnel still has its route.")
+        }
+    }
+
+    /// Fresh ordinary connections with no interface or address binding, so only real routing can deliver them. The
+    /// baseline is taken here, so earlier traffic cannot satisfy this checkpoint.
+    private static func checkpoint(_ tunnels: [HelperSmokeManifest.Tunnel], client: HelperClient) async throws {
+        var baselines: [PeerStats] = []
+        for tunnel in tunnels { baselines.append(try await peer(of: tunnel, client: client)) }
+
+        let answers = await withTaskGroup(of: Bool.self, returning: [Bool].self) { group in
+            for tunnel in tunnels {
+                group.addTask {
+                    for _ in 0..<fullRouteProbeAttempts {
+                        if await rawProbe(tunnel, timeout: probeTimeout) { return true }
+                    }
+                    return false
+                }
+            }
+            var results: [Bool] = []
+            for await answer in group { results.append(answer) }
+            return results
+        }
+        guard answers.allSatisfy({ $0 }) else { throw Failure("A tunnel did not return its exact token.") }
+
+        for (tunnel, baseline) in zip(tunnels, baselines) {
+            let after = try await peer(of: tunnel, client: client)
+            guard after.latestHandshake != nil else { throw Failure("A tunnel answered with no real handshake.") }
+            guard after.txBytes > baseline.txBytes, after.rxBytes > baseline.rxBytes else {
+                throw Failure("A tunnel answered without its own sent and received counters both growing.")
+            }
+        }
+    }
+}
+
+/// Fixed read-only commands for the full-route proof, with a deadline. Nothing else in the protocol is ever reached.
+private final class ReadOnlyCommands: CommandRunning {
+    func run(_ executable: String, _ args: [String], timeout: TimeInterval, readyMarker: String?) -> CommandResult {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = args
+        process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = pipe
+        process.standardError = pipe
+        do {
+            try process.run()
+        } catch {
+            return CommandResult(status: 126, output: "")
+        }
+        let watchdog = DispatchWorkItem { process.terminate() }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        watchdog.cancel()
+        return CommandResult(status: process.terminationStatus, output: String(decoding: data, as: UTF8.self))
+    }
+
+    func liveProcessGroups(matching argv: [String]) -> [Int32] { [] }
+    func terminateProcessGroup(_ pgid: Int32) {}
+    func pause(_ seconds: TimeInterval) {}
+}
+
 /// One plain HTTP GET over TCP, with a unique path so that no answer can be a cached one.
 private final class TCPProbe {
     private static let maxBytes = 16 * 1024
