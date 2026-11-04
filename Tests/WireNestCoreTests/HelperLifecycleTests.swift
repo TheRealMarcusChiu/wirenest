@@ -312,6 +312,19 @@ final class HelperLifecycleTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: foreign.path))
     }
 
+    func testAJournalFromBeforeEndpointRoutesStillAdoptsItsTunnels() throws {
+        let id = UUID()
+        ok(.up(tunnelID: id, config: conf(1)))
+        let journal = paths.runtimeDir.appendingPathComponent("session.json")
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: journal)) as? [String: Any])
+        XCTAssertNotNil(object.removeValue(forKey: "endpointRoutes"), "the field this test removes must exist")
+        try JSONSerialization.data(withJSONObject: object).write(to: journal)
+
+        let recovered = try restartedEngine()
+        XCTAssertEqual(recovered.handle(.status).status?.tunnels.map(\.tunnelID), [id])
+        XCTAssertNotNil(commands.slots["wn0"], "an old journal must never orphan a live tunnel")
+    }
+
     func testDownAllRemovesEveryOwnedDevice() {
         ok(.up(tunnelID: UUID(), config: conf(1)))
         ok(.up(tunnelID: UUID(), config: conf(2)))

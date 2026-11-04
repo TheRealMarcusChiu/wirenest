@@ -60,12 +60,45 @@ public final class HelperEngine {
         var proofFailure: String?
     }
 
+    /// A host route this helper added, keeping another tunnel's endpoint out of a default-route tunnel. Journaled before
+    /// `route` runs and removed only once the row is verified gone or affirmatively someone else's.
+    private struct EndpointRoute: Codable {
+        enum Phase: String, Codable { case adding, installed, removing }
+        let gateway: String
+        let interface: String
+        var phase: Phase
+    }
+
     private struct Session: Codable {
         var tunnels: [UUID: Entry] = [:]
+        var endpointRoutes: [String: EndpointRoute] = [:]
+
+        private enum CodingKeys: String, CodingKey { case tunnels, endpointRoutes }
+
+        init() {}
+
+        /// A journal from before endpoint routes must still adopt its live tunnels.
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            tunnels = try container.decode([UUID: Entry].self, forKey: .tunnels)
+            endpointRoutes = try container.decodeIfPresent([String: EndpointRoute].self, forKey: .endpointRoutes) ?? [:]
+        }
+    }
+
+    /// Who needs a protective route right now. Recomputed from the journal each time, so shared endpoints need no refcount.
+    private struct EndpointDemand {
+        /// Endpoints whose route must not be removed.
+        var keep: Set<String> = []
+        /// The part of `keep` this helper may add a route for. A default owner's own endpoint is wg-quick's.
+        var addable: Set<String> = []
     }
 
     /// wg-quick prints this just before forking its route monitor.
     private static let readyMarker = "Backgrounding route monitor"
+    private static let routeTool = "/sbin/route"
+    private static let noRouteAdded = "No protective route was added."
+    private static let routeUnconfirmed = "A protective route command ran, but its effect could not be confirmed."
+    private static let routeDebtMessage = "A protective route to a tunnel's endpoint could not be confirmed or removed. It stays tracked and will be retried."
     private static let pollInterval: TimeInterval = 0.25
     private static let cleanupPolls = 80
     private static let retryCleanupPolls = 20
@@ -76,6 +109,9 @@ public final class HelperEngine {
     private let dns: DNSManager
     private var session = Session()
     private var routeFailure: String?
+    /// Why the last reconcile could not protect an endpoint, for the message that refusal ends in.
+    private var endpointRouteProblems: [String: (reason: String, tail: String)] = [:]
+    private var endpointRouteDebt: String?
 
     private var sessionURL: URL { paths.runtimeDir.appendingPathComponent("session.json") }
 
@@ -139,6 +175,9 @@ public final class HelperEngine {
         }
         if session.tunnels.isEmpty {
             do { try dns.restore() } catch { firstError = firstError ?? error }
+            // Uninstall removes the journal after this, so nothing can be left for a later retry.
+            reconcileEndpointRoutes()
+            if let debt = endpointRouteDebt { firstError = firstError ?? SecureFileError(debt) }
         }
         if let firstError { throw firstError }
     }
@@ -169,15 +208,27 @@ public final class HelperEngine {
             runningConfig(name).map { NamedConfig(name: name, config: $0) }
         }
         let newName = "new tunnel"
-        let assessment = assessRoutes(others + [NamedConfig(name: newName, config: config)])
+        let candidate = NamedConfig(name: newName, config: config)
+        let assessment = assessRoutes(others + [candidate])
         if !assessment.conflicts.isEmpty { throw RouteConflictError(conflicts: assessment.conflicts) }
-        for exposure in assessment.exposures where exposure.tunnel == newName || exposure.defaultOwner == newName {
-            if let failure = endpointProofFailure(exposure) { throw SecureFileError(failure) }
-        }
 
         let used = Set(session.tunnels.values.map(\.name))
         guard let name = HelperConstants.slotNames.first(where: { !used.contains($0) }) else {
             throw SecureFileError("At most \(HelperConstants.maxTunnels) tunnels can run at once.")
+        }
+
+        let exposures = assessment.exposures.filter { $0.tunnel == newName || $0.defaultOwner == newName }
+        if !exposures.isEmpty {
+            // Before any config or spawn, so the endpoint is already pinned when the capturing /1 routes appear.
+            reconcileEndpointRoutes(candidate: candidate)
+            // A new default owner's own endpoint only gets its route from wg-quick, so it is proved after the start.
+            let managed = ownEndpoints(ofDefaultOwner: candidate) ?? []
+            for exposure in exposures {
+                if let failure = endpointProofFailure(exposure, deferring: exposure.defaultOwner == newName ? managed : []) {
+                    reconcileEndpointRoutes()
+                    throw SecureFileError(failure)
+                }
+            }
         }
 
         session.tunnels[id] = Entry(name: name, phase: .starting, interface: nil)
@@ -191,6 +242,7 @@ public final class HelperEngine {
             session.tunnels[id] = nil
             try? FileManager.default.removeItem(at: confURL(name))
             try? saveSession()
+            reconcileEndpointRoutes()
             throw error
         }
 
@@ -230,38 +282,252 @@ public final class HelperEngine {
     // MARK: Default-route safety
 
     /// A tunnel running beside a default-route tunnel is safe only while its endpoints are proven to stay outside it.
-    private func endpointProofFailure(_ exposure: EndpointExposure) -> String? {
-        let endpoints: [String]
-        if let entry = session.tunnels.values.first(where: { $0.name == exposure.tunnel }) {
-            let unknown = unsafeRouteMessage("a tunnel's endpoint", reason: "its current endpoint is unknown")
-            guard let real = realInterface(entry.name) ?? entry.interface else { return unknown }
-            let result = runner.run(paths.wg, ["show", real, "endpoints"], timeout: 5, readyMarker: nil)
-            if result.status == 0, let actual = parseWgEndpoints(result.output) {
-                endpoints = actual
-            } else if isInterfaceAbsent(real) {
-                // Only a device that is really gone has nothing to send. Failing to read it proves nothing, and its restart is checked on the way up.
-                return nil
-            } else {
-                return unknown
-            }
-        } else {
-            endpoints = exposure.configuredEndpoints
+    private func endpointProofFailure(_ exposure: EndpointExposure, deferring: Set<String> = []) -> String? {
+        guard let endpoints = currentEndpoints(of: exposure) else {
+            return unsafeRouteMessage("a tunnel's endpoint", reason: "its current endpoint is unknown")
         }
-
-        let owned = Set(session.tunnels.values.compactMap { realInterface($0.name) ?? $0.interface })
+        let owned = ownedInterfaces()
         for endpoint in endpoints where CIDR(endpoint)?.isIPv6 == exposure.isIPv6 {
             if exposure.isIPv6 {
                 return unsafeRouteMessage(endpoint, reason: "IPv6 endpoints cannot be proved")
             }
+            if deferring.contains(endpoint) { continue }
             if let reason = EndpointRouteProof.refusal(endpoint: endpoint, ownedInterfaces: owned, runner: runner) {
-                return unsafeRouteMessage(endpoint, reason: reason)
+                if gatewayRouteProven(endpoint, ownedInterfaces: owned) { continue }
+                return unsafeRouteMessage(endpoint, reason: endpointRouteProblems[endpoint]?.reason ?? reason)
             }
         }
         return nil
     }
 
     private func unsafeRouteMessage(_ endpoint: String, reason: String) -> String {
-        "Cannot safely run this tunnel beside the default-route tunnel: no proven physical-LAN or loopback route to \(endpoint) more specific than its /1 routes (\(reason)). No protective route was added."
+        let tail = endpointRouteProblems[endpoint]?.tail
+            ?? (session.endpointRoutes.isEmpty ? Self.noRouteAdded : "Protective routes already added stay tracked until they can be removed.")
+        return "Cannot safely run this tunnel beside the default-route tunnel: no proven physical-LAN, loopback or gateway route to \(endpoint) more specific than its /1 routes (\(reason)). \(tail)"
+    }
+
+    private func ownedInterfaces() -> Set<String> {
+        Set(session.tunnels.values.compactMap { realInterface($0.name) ?? $0.interface })
+    }
+
+    /// What this device is really using. Empty only if it is really gone: failing to read it proves nothing, and its restart is checked on the way up.
+    private func actualEndpoints(of entry: Entry) -> [String]? {
+        guard let real = realInterface(entry.name) ?? entry.interface else { return nil }
+        let result = runner.run(paths.wg, ["show", real, "endpoints"], timeout: 5, readyMarker: nil)
+        if result.status == 0, let actual = parseWgEndpoints(result.output) { return actual }
+        return isInterfaceAbsent(real) ? [] : nil
+    }
+
+    private func currentEndpoints(of exposure: EndpointExposure) -> [String]? {
+        guard let entry = session.tunnels.values.first(where: { $0.name == exposure.tunnel }) else { return exposure.configuredEndpoints }
+        return actualEndpoints(of: entry)
+    }
+
+    /// The endpoints wg-quick manages for a default-route tunnel, numeric only. Nil if a live device cannot be read.
+    private func ownEndpoints(ofDefaultOwner owner: NamedConfig) -> Set<String>? {
+        var hosts = Set(owner.config.peers.compactMap { peer -> String? in
+            guard let host = peer.endpoint?.host, CIDR(host)?.isIPv6 == false else { return nil }
+            return host
+        })
+        if let entry = session.tunnels.values.first(where: { $0.name == owner.name }) {
+            guard let actual = actualEndpoints(of: entry) else { return nil }
+            hosts.formUnion(actual)
+        }
+        return hosts
+    }
+
+    /// A row found exact counts only under the gateway the kernel uses now, and a timed out add stays unproven until a later reconcile settles it.
+    private func gatewayRouteProven(_ endpoint: String, ownedInterfaces owned: Set<String>) -> Bool {
+        guard session.endpointRoutes[endpoint]?.phase != .adding else { return false }
+        let table = EndpointRouteProof.readRoutingTable(runner)
+        guard let physical = EndpointRouteProof.physicalGateway(
+            netstat: table,
+            ifconfig: runner.run("/sbin/ifconfig", ["-a"], timeout: 5, readyMarker: nil),
+            hardwarePorts: runner.run("/usr/sbin/networksetup", ["-listallhardwareports"], timeout: 15, readyMarker: nil),
+            ownedInterfaces: owned
+        ) else { return false }
+        return EndpointRouteProof.gatewayRouteProven(
+            endpoint: endpoint, via: physical, netstat: table,
+            routeLookup: runner.run(Self.routeTool, ["-n", "get", "-inet", endpoint], timeout: 5, readyMarker: nil)
+        )
+    }
+
+    // MARK: Endpoint routes
+
+    /// Nil if anything needed to decide is unknown, which must never read as nobody needing a route.
+    private func endpointDemand(candidate: NamedConfig?) -> EndpointDemand? {
+        var named = candidate.map { [$0] } ?? []
+        for entry in session.tunnels.values {
+            guard let config = runningConfig(entry.name) else { return nil }
+            named.append(NamedConfig(name: entry.name, config: config))
+        }
+
+        var demand = EndpointDemand()
+        for exposure in assessRoutes(named).exposures where !exposure.isIPv6 {
+            guard let endpoints = currentEndpoints(of: exposure)?.filter({ CIDR($0)?.isIPv6 == false }) else { return nil }
+            guard !endpoints.isEmpty else { continue }
+            guard let owner = named.first(where: { $0.name == exposure.defaultOwner }),
+                  let managed = ownEndpoints(ofDefaultOwner: owner) else { return nil }
+            demand.keep.formUnion(endpoints)
+            demand.addable.formUnion(endpoints.filter { !managed.contains($0) })
+        }
+
+        // A default owner now using one of our routes would capture its own traffic if that route were removed.
+        if !session.endpointRoutes.isEmpty {
+            for owner in named where owner.config.table != .off && owner.config.peers.flatMap(\.allowedIPs).contains(where: { $0.isDefaultRoute && !$0.isIPv6 }) {
+                guard let managed = ownEndpoints(ofDefaultOwner: owner) else { return nil }
+                demand.keep.formUnion(managed.intersection(session.endpointRoutes.keys))
+            }
+        }
+        return demand
+    }
+
+    /// The only code that changes endpoint routes. Records why it could not rather than throwing: the proof
+    /// that follows every call decides what that means, and cleanup debt stays journaled and visible.
+    private func reconcileEndpointRoutes(candidate: NamedConfig? = nil) {
+        endpointRouteProblems = [:]
+        guard let demand = endpointDemand(candidate: candidate) else {
+            endpointRouteDebt = session.endpointRoutes.isEmpty ? nil : Self.routeDebtMessage
+            return
+        }
+        if demand.addable.isEmpty && session.endpointRoutes.isEmpty {
+            endpointRouteDebt = nil
+            return
+        }
+        var settled = true
+        for (endpoint, route) in session.endpointRoutes.sorted(by: { $0.key < $1.key }) where !demand.keep.contains(endpoint) {
+            if !removeEndpointRoute(endpoint, route) { settled = false }
+        }
+        for endpoint in demand.addable.sorted() { ensureEndpointRoute(endpoint) }
+        endpointRouteDebt = settled ? nil : Self.routeDebtMessage
+    }
+
+    private func recordEndpointRoute(_ endpoint: String, _ route: EndpointRoute?) -> Bool {
+        let previous = session.endpointRoutes[endpoint]
+        session.endpointRoutes[endpoint] = route
+        do {
+            try saveSession()
+            return true
+        } catch {
+            session.endpointRoutes[endpoint] = previous
+            return false
+        }
+    }
+
+    private func ensureEndpointRoute(_ endpoint: String) {
+        let problem: (String, String) -> Void = { reason, tail in self.endpointRouteProblems[endpoint] = (reason, tail) }
+        let table = EndpointRouteProof.readRoutingTable(runner)
+        let owned = ownedInterfaces()
+
+        if let tracked = session.endpointRoutes[endpoint] {
+            switch EndpointRouteProof.endpointRow(endpoint, gateway: tracked.gateway, interface: tracked.interface, netstat: table) {
+            case .exact:
+                // Left as it is even if the gateway has moved. The proof fails and stops the default first, and only then is it removed.
+                if tracked.phase != .installed {
+                    var installed = tracked
+                    installed.phase = .installed
+                    _ = recordEndpointRoute(endpoint, installed)
+                }
+                return
+            case .unknown:
+                return
+            case .foreign:
+                // Someone else's row now, so ownership ends here and that row stays.
+                _ = recordEndpointRoute(endpoint, nil)
+                problem("another route to it replaced the protective one", "That route was left in place.")
+                return
+            case .absent, .cloneOnly:
+                guard recordEndpointRoute(endpoint, nil) else { return }
+            }
+        }
+
+        guard EndpointRouteProof.refusal(endpoint: endpoint, ownedInterfaces: owned, runner: runner) != nil else { return }
+        guard EndpointRouteProof.isProtectableEndpoint(endpoint) else {
+            problem("only a numeric unicast IPv4 endpoint can get a protective route", Self.noRouteAdded)
+            return
+        }
+        let ifconfig = runner.run("/sbin/ifconfig", ["-a"], timeout: 5, readyMarker: nil)
+        guard let physical = EndpointRouteProof.physicalGateway(
+            netstat: table, ifconfig: ifconfig,
+            hardwarePorts: runner.run("/usr/sbin/networksetup", ["-listallhardwareports"], timeout: 15, readyMarker: nil),
+            ownedInterfaces: owned
+        ) else {
+            problem("the physical default gateway could not be proven", Self.noRouteAdded)
+            return
+        }
+        guard !EndpointRouteProof.isOnLink(endpoint, ifconfig: ifconfig) else {
+            problem("it is on a connected network, which a gateway route cannot protect", Self.noRouteAdded)
+            return
+        }
+        guard !EndpointRouteProof.hasCoveringRoute(endpoint, netstat: table) else {
+            problem("another route already covers it", Self.noRouteAdded)
+            return
+        }
+        switch EndpointRouteProof.endpointRow(endpoint, gateway: physical.gateway, interface: physical.interface, netstat: table) {
+        case .exact:
+            return  // Not ours: the proof may rely on it, and nothing here ever deletes it.
+        case .unknown:
+            problem("the routing table could not be read", Self.noRouteAdded)
+            return
+        case .foreign:
+            problem("a different route to it already exists", Self.noRouteAdded)
+            return
+        case .absent, .cloneOnly:
+            break
+        }
+
+        guard recordEndpointRoute(endpoint, EndpointRoute(gateway: physical.gateway, interface: physical.interface, phase: .adding)) else {
+            problem("its intent could not be recorded", Self.noRouteAdded)
+            return
+        }
+        let added = runner.run(Self.routeTool, ["-q", "-n", "add", "-inet", endpoint, "-gateway", physical.gateway], timeout: 5, readyMarker: nil)
+        if added.status != 0 {
+            if added.status == 124 || added.status >= 128 {
+                // It may or may not have happened, so this stays tracked like a crash in the same place.
+                problem("adding the route timed out", Self.routeUnconfirmed)
+            } else {
+                // A refused add leaves nothing of ours, and whatever made it fail is not ours to adopt or delete.
+                _ = recordEndpointRoute(endpoint, nil)
+                problem("the route could not be added", Self.noRouteAdded)
+            }
+            return
+        }
+        switch EndpointRouteProof.endpointRow(endpoint, gateway: physical.gateway, interface: physical.interface, netstat: EndpointRouteProof.readRoutingTable(runner)) {
+        case .exact:
+            _ = recordEndpointRoute(endpoint, EndpointRoute(gateway: physical.gateway, interface: physical.interface, phase: .installed))
+        case .unknown:
+            problem("the added route could not be read back", Self.routeUnconfirmed)
+        case .absent, .cloneOnly, .foreign:
+            _ = recordEndpointRoute(endpoint, nil)
+            problem("the added route did not take effect", Self.routeUnconfirmed)
+        }
+    }
+
+    /// True once nothing of ours remains. Deletes only a row that is exactly the one recorded, read immediately before.
+    private func removeEndpointRoute(_ endpoint: String, _ route: EndpointRoute) -> Bool {
+        guard EndpointRouteProof.isProtectableEndpoint(endpoint), CIDR(route.gateway)?.isIPv6 == false, !route.gateway.contains("/") else { return false }
+        func rowNow() -> EndpointRowState {
+            EndpointRouteProof.endpointRow(endpoint, gateway: route.gateway, interface: route.interface, netstat: EndpointRouteProof.readRoutingTable(runner))
+        }
+        switch rowNow() {
+        case .unknown:
+            return false
+        case .absent, .cloneOnly, .foreign:
+            return recordEndpointRoute(endpoint, nil)
+        case .exact:
+            break
+        }
+        var removing = route
+        removing.phase = .removing
+        guard recordEndpointRoute(endpoint, removing) else { return false }
+        // The verification below decides, not this exit status.
+        _ = runner.run(Self.routeTool, ["-q", "-n", "delete", "-inet", endpoint, route.gateway], timeout: 5, readyMarker: nil)
+        switch rowNow() {
+        case .unknown, .exact:
+            return false
+        case .absent, .cloneOnly, .foreign:
+            return recordEndpointRoute(endpoint, nil)
+        }
     }
 
     /// A running device and a ready marker say nothing about routes. A new tunnel of a pair runs only once
@@ -314,6 +580,7 @@ public final class HelperEngine {
             try? retire(id, polls: Self.retryCleanupPolls)
         }
         routeFailure = session.tunnels.values.compactMap(\.proofFailure).first
+        reconcileEndpointRoutes()
 
         let running = session.tunnels.filter { $0.value.phase == .running }
         let named = running.values.map(\.name).sorted().compactMap { name in
@@ -330,6 +597,7 @@ public final class HelperEngine {
                 routeFailure = "\(failure) Stopping the default-route tunnel is incomplete and will be retried: \(error.localizedDescription)"
             }
         }
+        routeFailure = routeFailure ?? endpointRouteDebt
     }
 
     private func down(_ id: UUID) throws {
@@ -369,6 +637,8 @@ public final class HelperEngine {
         session.tunnels[id] = nil
         try? FileManager.default.removeItem(at: confURL(entry.name))
         try saveSession()
+        // Only now, so a tunnel's route outlives its traffic and the default's /1 routes. A route that stays is reported as debt, not thrown: this tunnel really is gone.
+        reconcileEndpointRoutes()
         if session.tunnels.isEmpty { try dns.restore() }
     }
 

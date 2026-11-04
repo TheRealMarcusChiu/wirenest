@@ -96,6 +96,99 @@ public enum InterfacePresence: Equatable {
     case present, absent, unknown
 }
 
+/// The only kind of gateway a protective endpoint route may use, derived from the kernel's own default route.
+public struct PhysicalGateway: Codable, Equatable {
+    public let gateway: String
+    public let interface: String
+
+    public init(gateway: String, interface: String) {
+        self.gateway = gateway
+        self.interface = interface
+    }
+}
+
+/// What the kernel's table holds for one endpoint, judged against one gateway. `unknown` is never `absent`.
+public enum EndpointRowState: Equatable {
+    case unknown, absent, exact, cloneOnly, foreign
+}
+
+extension EndpointRouteProof {
+    /// A capture the proof can reason about: a failed or possibly cut one shows nothing, least of all that something is missing.
+    private static func isComplete(_ result: CommandResult) -> Bool {
+        result.status == 0 && result.output.utf8.count < HelperConstants.maxCommandOutputBytes
+    }
+
+    /// The unique unscoped IPv4 default, on a running hardware port, through a gateway on its connected network.
+    /// A foreign `/1` means something else already decides where traffic goes, so that is no answer either.
+    public static func physicalGateway(netstat: CommandResult, ifconfig: CommandResult, hardwarePorts: CommandResult, ownedInterfaces: Set<String>) -> PhysicalGateway? {
+        guard isComplete(netstat), isComplete(ifconfig), isComplete(hardwarePorts),
+              let rows = completeRoutingTable(netstat.output), let interfaces = parseInterfaces(ifconfig.output),
+              interfaces["lo0"]?.flags.contains("LOOPBACK") == true else { return nil }
+        guard !rows.contains(where: { $0.network.prefix == 1 && !ownedInterfaces.contains($0.interface) }) else { return nil }
+
+        let defaults = rows.filter { $0.network.prefix == 0 && !$0.isScoped && !$0.flags.contains("I") }
+        guard defaults.count == 1, let row = defaults.first, row.flags.isSuperset(of: Set("UG")), row.flags.isDisjoint(with: Set("BRW")),
+              let gateway = ipv4Value(row.gateway), !ownedInterfaces.contains(row.interface),
+              let interface = interfaces[row.interface], interface.flags.isSuperset(of: ["UP", "RUNNING"]),
+              interface.flags.isDisjoint(with: ["LOOPBACK", "POINTOPOINT"]), interface.status == nil || interface.status == "active",
+              parseHardwareDevices(hardwarePorts.output).contains(row.interface), !interface.addresses.contains(gateway) else { return nil }
+
+        let networks = interface.networks.filter { (2...31).contains($0.prefix) && $0.contains(gateway) }
+        guard let network = networks.max(by: { $0.prefix < $1.prefix }) else { return nil }
+        let connected = rows.contains { candidate in
+            candidate.network == network && candidate.interface == row.interface && !candidate.isScoped
+                && candidate.flags.contains("U") && candidate.flags.contains("C") && candidate.flags.isDisjoint(with: Set("GHIWBRL"))
+                && (candidate.gateway.hasPrefix("link#") || ipv4Value(candidate.gateway).map { interface.addresses.contains($0) } == true)
+        }
+        return connected ? PhysicalGateway(gateway: row.gateway, interface: row.interface) : nil
+    }
+
+    /// Numeric IPv4 unicast only, so nothing else can ever reach `route` as an endpoint.
+    public static func isProtectableEndpoint(_ endpoint: String) -> Bool {
+        guard let value = ipv4Value(endpoint) else { return false }
+        let first = value >> 24
+        return first != 0 && first != 127 && first < 224 && value >> 16 != 0xA9FE
+    }
+
+    /// True for an endpoint on any connected network, or when that cannot be told. Those belong to the connected-route proof.
+    public static func isOnLink(_ endpoint: String, ifconfig: CommandResult) -> Bool {
+        guard isComplete(ifconfig), let value = ipv4Value(endpoint), let interfaces = parseInterfaces(ifconfig.output) else { return true }
+        return interfaces.values.contains { interface in
+            interface.addresses.contains(value) || interface.networks.contains { (2...31).contains($0.prefix) && $0.contains(value) }
+        }
+    }
+
+    /// Whether a non-cloned route narrower than `/1` but wider than a host covers it, which a pinned host route would silently override. Unknown is yes.
+    public static func hasCoveringRoute(_ endpoint: String, netstat: CommandResult) -> Bool {
+        guard isComplete(netstat), let value = ipv4Value(endpoint), let rows = completeRoutingTable(netstat.output) else { return true }
+        return rows.contains { (2...31).contains($0.network.prefix) && $0.network.contains(value) && !$0.flags.contains("W") }
+    }
+
+    public static func endpointRow(_ endpoint: String, gateway: String, interface: String, netstat: CommandResult) -> EndpointRowState {
+        guard isComplete(netstat), let value = ipv4Value(endpoint), let rows = completeRoutingTable(netstat.output) else { return .unknown }
+        let matching = rows.filter { $0.network == IPv4Network(address: value, prefix: 32) }
+        guard !matching.isEmpty else { return .absent }
+        let isExact: (RoutingRow) -> Bool = { row in
+            !row.isScoped && row.gateway == gateway && row.interface == interface
+                && row.flags.isSuperset(of: Set("UGHS")) && row.flags.isDisjoint(with: Set("IBRW"))
+        }
+        let exactCount = matching.filter(isExact).count
+        let others = matching.filter { !isExact($0) && !$0.flags.contains("W") }
+        guard others.isEmpty, exactCount <= 1 else { return .foreign }
+        return exactCount == 1 ? .exact : .cloneOnly
+    }
+
+    /// The exact pinned row in the kernel's table, and an ordinary lookup that actually selects it.
+    public static func gatewayRouteProven(endpoint: String, via physical: PhysicalGateway, netstat: CommandResult, routeLookup: CommandResult) -> Bool {
+        guard endpointRow(endpoint, gateway: physical.gateway, interface: physical.interface, netstat: netstat) == .exact,
+              routeLookup.status == 0, let lookup = RouteLookup(routeLookup.output), let value = ipv4Value(endpoint) else { return false }
+        return lookup.destination.flatMap(ipv4Value) == value && lookup.gateway == physical.gateway && lookup.interface == physical.interface
+            && lookup.flags.isSuperset(of: ["HOST", "GATEWAY", "STATIC"])
+            && lookup.flags.isDisjoint(with: ["REJECT", "BLACKHOLE", "WASCLONED", "IFSCOPE"])
+            && lookup.mask.map { prefixLength(ofMask: $0) == 32 } ?? true
+    }
+}
+
 extension EndpointRouteProof {
     /// Only a complete `ifconfig -a` listing can show that something is missing. `ifconfig IF` exits 1 for permission, socket
     /// and read errors too. Capture keeps the end of long output, and lo0 comes first, so its absence or a full capture means a cut.
@@ -196,6 +289,7 @@ private struct IPv4Network: Equatable {
 private struct RouteLookup {
     let destination: String?
     let mask: String?
+    let gateway: String?
     let interface: String
     let flags: Set<String>
 
@@ -212,6 +306,7 @@ private struct RouteLookup {
               let flagText = fields["flags"], flagText.hasPrefix("<"), flagText.hasSuffix(">") else { return nil }
         self.destination = fields["destination"]
         self.mask = fields["mask"]
+        self.gateway = fields["gateway"]
         self.interface = interface
         self.flags = Set(flagText.dropFirst().dropLast().split(separator: ",").map(String.init))
         guard !flags.isEmpty else { return nil }
@@ -264,6 +359,42 @@ private struct RoutingRow {
     let gateway: String
     let flags: Set<Character>
     let interface: String
+    var isScoped = false
+}
+
+/// `netstat -rn -f inet` for decisions that change routes, where a row not understood could be the one that matters: any such row, a
+/// missing header or an empty table makes the whole table unknown. Includes `default`, which the proof-only parser below has no use for.
+private func completeRoutingTable(_ output: String) -> [RoutingRow]? {
+    var rows: [RoutingRow] = []
+    var inInternet = false, sawHeader = false
+    for line in output.split(separator: "\n") {
+        if line.hasPrefix("Internet:") {
+            guard !inInternet else { return nil }
+            inInternet = true
+            continue
+        }
+        guard inInternet else { continue }
+        let tokens = line.split(whereSeparator: \.isWhitespace).map(String.init)
+        if tokens.isEmpty { continue }
+        if tokens[0] == "Destination" {
+            guard !sawHeader, tokens.starts(with: ["Destination", "Gateway", "Flags", "Netif"]) else { return nil }
+            sawHeader = true
+            continue
+        }
+        guard sawHeader, tokens.count >= 4, isInterfaceName(tokens[3]) else { return nil }
+
+        var destination = tokens[0]
+        var isScoped = false
+        if let percent = destination.firstIndex(of: "%") {
+            isScoped = true
+            let end = destination[percent...].firstIndex(of: "/") ?? destination.endIndex
+            destination.removeSubrange(percent..<end)
+        }
+        let parsed: IPv4Network? = destination == "default" ? IPv4Network(address: 0, prefix: 0) : IPv4Network(netstatDestination: destination)
+        guard let network = parsed else { return nil }
+        rows.append(RoutingRow(network: network, gateway: tokens[1], flags: Set(tokens[2]), interface: tokens[3], isScoped: isScoped))
+    }
+    return sawHeader && !rows.isEmpty ? rows : nil
 }
 
 /// `netstat -rn -f inet`. Rows it cannot read are skipped, as they can only fail to provide proof.

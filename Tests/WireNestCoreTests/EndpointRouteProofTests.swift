@@ -534,6 +534,721 @@ final class FullLANAssessmentTests: XCTestCase {
     }
 }
 
+/// Everything here is synthetic: documentation addresses shaped like Darwin output, with no route ever changed for real.
+final class PhysicalGatewayParsingTests: XCTestCase {
+    private let table = """
+    Routing tables
+
+    Internet:
+    Destination        Gateway            Flags               Netif Expire
+    default            192.168.86.1       UGScg                 en0
+    127                127.0.0.1          UCS                   lo0
+    192.168.86         link#7             UCS                   en0      !
+
+    """
+    private let interfaces = """
+    lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+    \tinet 127.0.0.1 netmask 0xff000000
+    en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+    \tinet 192.168.86.20 netmask 0xffffff00 broadcast 192.168.86.255
+    \tstatus: active
+
+    """
+    private let ports = "\nHardware Port: Wi-Fi\nDevice: en0\nEthernet Address: 00:00:00:00:00:01\n"
+
+    private func good(_ output: String) -> CommandResult { CommandResult(status: 0, output: output) }
+
+    private func physical(
+        table tableText: String? = nil, netstat: CommandResult? = nil, interfaces interfaceText: String? = nil,
+        ifconfig: CommandResult? = nil, ports portText: String? = nil, owned: Set<String> = []
+    ) -> PhysicalGateway? {
+        EndpointRouteProof.physicalGateway(
+            netstat: netstat ?? good(tableText ?? table), ifconfig: ifconfig ?? good(interfaceText ?? interfaces),
+            hardwarePorts: good(portText ?? ports), ownedInterfaces: owned
+        )
+    }
+
+    func testAUniqueUnscopedDefaultOnAConnectedHardwarePortIsThePhysicalGateway() {
+        XCTAssertEqual(physical(), PhysicalGateway(gateway: "192.168.86.1", interface: "en0"))
+        XCTAssertEqual(physical(table: table + "default            192.168.90.1       UGScIg                en1\n"),
+                       PhysicalGateway(gateway: "192.168.86.1", interface: "en0"), "a scoped default on another interface is not ambiguous")
+        XCTAssertEqual(physical(table: table + "0/1 utun8 USc utun8\n128.0/1 utun8 USc utun8\n", owned: ["utun8"]),
+                       PhysicalGateway(gateway: "192.168.86.1", interface: "en0"), "the kernel still lists it under our own /1 routes")
+    }
+
+    func testAnythingButThatIsNoGateway() {
+        let cases: [(String, PhysicalGateway?)] = [
+            ("no default", physical(table: table.replacingOccurrences(of: "default            192.168.86.1       UGScg                 en0\n", with: ""))),
+            ("two unscoped defaults", physical(table: table + "default            192.168.90.1       UGScg                 en1\n")),
+            ("link gateway", physical(table: table.replacingOccurrences(of: "192.168.86.1       UGScg", with: "link#7             UGScg"))),
+            ("no gateway flag", physical(table: table.replacingOccurrences(of: "UGScg", with: "UScg"))),
+            ("scoped only", physical(table: table.replacingOccurrences(of: "UGScg", with: "UGScIg"))),
+            ("outside the connected network", physical(table: table.replacingOccurrences(of: "192.168.86.1 ", with: "192.168.99.1 "))),
+            ("no connected row", physical(table: table.replacingOccurrences(of: "192.168.86         link#7             UCS                   en0      !\n", with: ""))),
+            ("a foreign VPN's default", physical(table: table.replacingOccurrences(of: "UGScg                 en0", with: "UGScg                 utun3"))),
+            ("our own tunnel's default", physical(table: table.replacingOccurrences(of: "UGScg                 en0", with: "UGScg                 en0"), owned: ["en0"])),
+            ("a foreign /1", physical(table: table + "0/1 utun3 USc utun3\n")),
+            ("not a hardware port", physical(ports: "\nHardware Port: Other\nDevice: en5\n")),
+            ("not running", physical(interfaces: interfaces.replacingOccurrences(of: "RUNNING,SIMPLEX", with: "SIMPLEX"))),
+            ("point to point", physical(interfaces: interfaces.replacingOccurrences(of: "BROADCAST", with: "POINTOPOINT"))),
+            ("inactive", physical(interfaces: interfaces.replacingOccurrences(of: "status: active", with: "status: inactive"))),
+            ("the gateway is ourselves", physical(table: table.replacingOccurrences(of: "192.168.86.1 ", with: "192.168.86.20"))),
+            ("netstat failed", physical(netstat: CommandResult(status: 1, output: table))),
+            ("netstat timed out", physical(netstat: CommandResult(status: 124, output: ""))),
+            ("netstat cut at the capture limit", physical(netstat: good(table + String(repeating: "x", count: HelperConstants.maxCommandOutputBytes)))),
+            ("netstat with its head cut off", physical(table: "192.168.86         link#7             UCS                   en0\n")),
+            ("a malformed row", physical(table: table + "nonsense\n")),
+            ("no header", physical(table: "Internet:\ndefault 192.168.86.1 UGScg en0\n")),
+            ("ifconfig failed", physical(ifconfig: CommandResult(status: 1, output: interfaces))),
+            ("ifconfig without its loopback", physical(interfaces: "en0: flags=8863<UP,RUNNING> mtu 1500\n\tinet 192.168.86.20 netmask 0xffffff00\n")),
+        ]
+        for (label, result) in cases { XCTAssertNil(result, label) }
+    }
+
+    func testOnlyNumericUnicastEndpointsCanBeProtected() {
+        for good in ["203.0.113.50", "198.51.100.13", "10.1.2.3", "223.255.255.254"] {
+            XCTAssertTrue(EndpointRouteProof.isProtectableEndpoint(good), good)
+        }
+        for bad in ["0.0.0.0", "0.1.2.3", "127.0.0.1", "127.77.0.2", "169.254.1.1", "224.0.0.1", "239.1.1.1", "240.0.0.1", "255.255.255.255",
+                    "2001:db8::1", "::1", "vpn.example.com", "203.0.113.50/32", "203.0.113.50; id", "", "-gateway"] {
+            XCTAssertFalse(EndpointRouteProof.isProtectableEndpoint(bad), bad)
+        }
+    }
+
+    private func row(_ extra: String, netstat: CommandResult? = nil) -> EndpointRowState {
+        EndpointRouteProof.endpointRow("203.0.113.50", gateway: "192.168.86.1", interface: "en0", netstat: netstat ?? good(table + extra))
+    }
+
+    func testEndpointRowsAreClassifiedStrictly() {
+        XCTAssertEqual(row(""), .absent)
+        XCTAssertEqual(row("203.0.113.50 192.168.86.1 UGHS en0\n"), .exact)
+        XCTAssertEqual(row("203.0.113.50/32 192.168.86.1 UGHS en0\n"), .exact, "the same route, however it is printed")
+        XCTAssertEqual(row("203.0.113.50 192.168.86.1 UGHWIig en0\n"), .cloneOnly)
+        for foreign in ["203.0.113.50 192.168.86.9 UGHS en0", "203.0.113.50 192.168.86.1 UGHS en1", "203.0.113.50 link#9 UHS utun3",
+                        "203.0.113.50 192.168.86.1 UGHSI en0", "203.0.113.50 192.168.86.1 UGHSB en0", "203.0.113.50 192.168.86.1 UGHSR en0",
+                        "203.0.113.50 192.168.86.1 UGS en0", "203.0.113.50%en0 192.168.86.1 UGHS en0"] {
+            XCTAssertEqual(row(foreign + "\n"), .foreign, foreign)
+        }
+        XCTAssertEqual(row("203.0.113.50 192.168.86.1 UGHS en0\n203.0.113.50 192.168.86.9 UGHS en0\n"), .foreign, "an exact row beside another is not ours alone")
+        XCTAssertEqual(row("", netstat: CommandResult(status: 1, output: table)), .unknown)
+        XCTAssertEqual(row("", netstat: good("no table")), .unknown)
+        XCTAssertEqual(row("", netstat: good(table + "broken\n")), .unknown)
+        XCTAssertEqual(row("", netstat: good(table + String(repeating: "x", count: HelperConstants.maxCommandOutputBytes))), .unknown, "a cut table cannot show absence")
+    }
+
+    func testOnlyANonClonedPrefixCoversAnEndpoint() {
+        func covered(_ extra: String) -> Bool { EndpointRouteProof.hasCoveringRoute("203.0.113.50", netstat: good(table + extra)) }
+        XCTAssertFalse(covered(""))
+        XCTAssertFalse(covered("0/1 utun8 USc utun8\n128.0/1 utun8 USc utun8\n"), "the /1 routes are what the protective route has to beat")
+        XCTAssertFalse(covered("203.0.113.50 192.168.86.1 UGHWIig en0\n"))
+        XCTAssertFalse(covered("203.0.113.50 192.168.86.1 UGHS en0\n"), "the endpoint's own row is judged separately")
+        XCTAssertTrue(covered("203.0.113/24 192.168.86.9 UGSc en0\n"))
+        XCTAssertTrue(covered("203/8 link#9 USc utun3\n"))
+        XCTAssertTrue(EndpointRouteProof.hasCoveringRoute("203.0.113.50", netstat: CommandResult(status: 1, output: "")), "unknown counts as covered")
+    }
+
+    func testAnEndpointOnAConnectedNetworkIsNotForAGatewayRoute() {
+        XCTAssertTrue(EndpointRouteProof.isOnLink("192.168.86.51", ifconfig: good(interfaces)))
+        XCTAssertFalse(EndpointRouteProof.isOnLink("203.0.113.50", ifconfig: good(interfaces)))
+        XCTAssertTrue(EndpointRouteProof.isOnLink("203.0.113.50", ifconfig: CommandResult(status: 1, output: "")), "unknown counts as on-link")
+    }
+
+    private func proven(lookup: String, status: Int32 = 0, extra: String = "203.0.113.50 192.168.86.1 UGHS en0\n") -> Bool {
+        EndpointRouteProof.gatewayRouteProven(
+            endpoint: "203.0.113.50", via: PhysicalGateway(gateway: "192.168.86.1", interface: "en0"),
+            netstat: good(table + extra), routeLookup: CommandResult(status: status, output: lookup)
+        )
+    }
+
+    private func lookup(destination: String = "203.0.113.50", gateway: String = "192.168.86.1", interface: String = "en0",
+                        flags: String = "UP,GATEWAY,HOST,DONE,STATIC", mask: String? = nil) -> String {
+        "   route to: 203.0.113.50\ndestination: \(destination)\n" + (mask.map { "       mask: \($0)\n" } ?? "")
+            + "    gateway: \(gateway)\n  interface: \(interface)\n      flags: <\(flags)>\n"
+    }
+
+    func testAGatewayRouteIsProvenOnlyByTheRowAndAnOrdinaryLookupTogether() {
+        XCTAssertTrue(proven(lookup: lookup()))
+        XCTAssertTrue(proven(lookup: lookup(mask: "255.255.255.255")))
+        XCTAssertFalse(proven(lookup: lookup(), extra: ""), "no row")
+        XCTAssertFalse(proven(lookup: lookup(), extra: "203.0.113.50 192.168.86.9 UGHS en0\n"), "another row")
+        XCTAssertFalse(proven(lookup: lookup(), status: 1))
+        XCTAssertFalse(proven(lookup: "garbage"))
+        XCTAssertFalse(proven(lookup: lookup(destination: "default")))
+        XCTAssertFalse(proven(lookup: lookup(gateway: "192.168.86.9")), "the lookup must name the gateway too")
+        XCTAssertFalse(proven(lookup: lookup(interface: "utun8")))
+        XCTAssertFalse(proven(lookup: lookup(mask: "255.255.255.0")))
+        XCTAssertFalse(proven(lookup: lookup(flags: "UP,GATEWAY,HOST,DONE")), "not static")
+        XCTAssertFalse(proven(lookup: lookup(flags: "UP,GATEWAY,HOST,DONE,STATIC,WASCLONED")))
+        XCTAssertFalse(proven(lookup: lookup(flags: "UP,GATEWAY,HOST,DONE,STATIC,IFSCOPE")))
+        XCTAssertFalse(proven(lookup: lookup(flags: "UP,GATEWAY,HOST,DONE,STATIC,REJECT")))
+    }
+}
+
+/// The real pair shape, with documentation addresses standing in for its public endpoints. Nothing here routes anything.
+final class GatewayEndpointRootTests: XCTestCase {
+    private var paths: HelperPaths!
+    private var commands: FakeCommands!
+    private var engine: HelperEngine!
+
+    private let endpoint = "203.0.113.50"
+    private let fullEndpoint = "198.51.100.13"
+    private lazy var split = confText(address: "10.20.0.2/32", allowedIPs: "192.168.111.0/24, 192.168.112.0/24", endpoint: "\(endpoint):12345")
+    private lazy var full = confText(address: "10.128.0.2/32", allowedIPs: "0.0.0.0/0, ::/0", endpoint: "\(fullEndpoint):1637", extraPeer: "PersistentKeepalive = 15")
+    private let splitID = UUID(), fullID = UUID()
+
+    override func setUpWithError() throws {
+        let root = try tempDirectory()
+        paths = HelperPaths(
+            runtimeDir: root.appendingPathComponent("run"),
+            wireguardRunDir: root.appendingPathComponent("wg"),
+            toolsDir: root.appendingPathComponent("tools"),
+            durableDir: root.appendingPathComponent("durable")
+        )
+        commands = FakeCommands(paths: paths)
+        commands.installSyntheticLAN()
+        for address in [endpoint, fullEndpoint, "203.0.113.7"] {
+            commands.routeGet[address] = CommandResult(status: 0, output: """
+               route to: \(address)
+            destination: default
+                   mask: default
+                gateway: 192.168.86.1
+              interface: en0
+                  flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>
+            """)
+        }
+        engine = try HelperEngine(paths: paths, runner: commands)
+    }
+
+    private func ok(_ request: HelperRequest, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertNil(engine.handle(request).error, file: file, line: line)
+    }
+
+    private var status: HelperStatus { engine.handle(.status).status! }
+    private func running(_ id: UUID) -> Bool { status.tunnels.contains { $0.tunnelID == id && $0.alive } }
+    private var upCount: Int { commands.quickCalls.filter { $0[1] == "up" }.count }
+    private var journalURL: URL { paths.runtimeDir.appendingPathComponent("session.json") }
+    private var journal: String { (try? String(contentsOf: journalURL, encoding: .utf8)) ?? "" }
+    private var deletes: [[String]] { commands.routeChanges.filter { $0[2] == "delete" } }
+    private var adds: [[String]] { commands.routeChanges.filter { $0[2] == "add" } }
+    private func restarted() throws -> HelperEngine {
+        let restarted = try HelperEngine(paths: paths, runner: commands)
+        restarted.recoverOnStart()
+        return restarted
+    }
+
+    private func startPair() {
+        ok(.up(tunnelID: splitID, config: split))
+        ok(.up(tunnelID: fullID, config: full))
+    }
+
+    // MARK: the pair
+
+    func testTheDualStackPairRunsInBothOrdersWithFixedArgv() {
+        startPair()
+        XCTAssertTrue(running(splitID))
+        XCTAssertTrue(running(fullID))
+        XCTAssertEqual(adds, [["-q", "-n", "add", "-inet", endpoint, "-gateway", "192.168.86.1"]])
+        XCTAssertNil(status.routeFailure)
+        XCTAssertFalse(commands.flatArgv.contains("inet6"), "nothing about IPv6 changes for an IPv4 endpoint")
+
+        ok(.downAll)
+        XCTAssertNil(commands.hostRoutes[endpoint])
+        XCTAssertFalse(journal.contains(endpoint))
+
+        ok(.up(tunnelID: fullID, config: full))
+        commands.routeGet[endpoint] = CommandResult(status: 0, output: "   route to: \(endpoint)\ndestination: 128.0.0.0\n       mask: 128.0.0.0\n  interface: utun9\n      flags: <UP,DONE,STATIC>\n")
+        ok(.up(tunnelID: splitID, config: split))
+        XCTAssertTrue(running(splitID))
+        XCTAssertTrue(running(fullID))
+        XCTAssertNotNil(commands.hostRoutes[endpoint])
+    }
+
+    func testTheRouteIsInPlaceBeforeTheCapturingTunnelsConfigOrSpawn() {
+        ok(.up(tunnelID: splitID, config: split))
+        var routeAtSpawn: String?, confAtAdd = true, journalAtAdd = ""
+        commands.onQuick = { [unowned self] _ in routeAtSpawn = self.commands.hostRoutes[self.endpoint] }
+        commands.onRouteChange = { [unowned self] verb in
+            guard verb == "add" else { return }
+            confAtAdd = FileManager.default.fileExists(atPath: self.paths.runtimeDir.appendingPathComponent("wn1.conf").path)
+            journalAtAdd = self.journal
+        }
+        ok(.up(tunnelID: fullID, config: full))
+        XCTAssertNotNil(routeAtSpawn)
+        XCTAssertFalse(confAtAdd, "no config is written before the route")
+        XCTAssertTrue(journalAtAdd.contains(endpoint) && journalAtAdd.contains("adding"), "ownership is durable before the change")
+        XCTAssertTrue(journal.contains("installed"))
+    }
+
+    func testTheSplitTunnelAloneNeverRunsRouteCommands() {
+        ok(.up(tunnelID: splitID, config: split))
+        _ = status
+        XCTAssertTrue(commands.routeChanges.isEmpty)
+    }
+
+    // MARK: independent stops and the last consumer
+
+    func testStoppingTheFullTunnelRemovesOurRouteOnlyAfterItsRoutesAreGone() {
+        startPair()
+        var slotAtDelete: Bool?
+        commands.onRouteChange = { [unowned self] _ in slotAtDelete = self.commands.slots["wn1"] != nil }
+        ok(.down(tunnelID: fullID))
+        XCTAssertEqual(slotAtDelete, false)
+        XCTAssertEqual(deletes, [["-q", "-n", "delete", "-inet", endpoint, "192.168.86.1"]])
+        XCTAssertNil(commands.hostRoutes[endpoint])
+        XCTAssertTrue(running(splitID), "the split is untouched")
+    }
+
+    func testStoppingTheSplitTunnelRemovesOurRouteAndKeepsTheFullTunnel() {
+        startPair()
+        ok(.down(tunnelID: splitID))
+        XCTAssertNil(commands.hostRoutes[endpoint])
+        XCTAssertTrue(running(fullID))
+    }
+
+    func testTwoSplitTunnelsShareOneRouteUntilTheLastStops() {
+        let other = UUID()
+        let second = confText(address: "10.21.0.2/32", allowedIPs: "192.168.113.0/24", endpoint: "\(endpoint):12346")
+        startPair()
+        ok(.up(tunnelID: other, config: second))
+        XCTAssertEqual(adds.count, 1, "no duplicate route")
+        ok(.down(tunnelID: splitID))
+        XCTAssertNotNil(commands.hostRoutes[endpoint], "still in use")
+        XCTAssertTrue(deletes.isEmpty)
+        ok(.down(tunnelID: other))
+        XCTAssertNil(commands.hostRoutes[endpoint])
+        XCTAssertEqual(deletes.count, 1)
+    }
+
+    func testAFailedSpawnRollsBackOnlyItsNewRoute() {
+        ok(.up(tunnelID: splitID, config: split))
+        commands.failUp = true
+        XCTAssertNotNil(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        commands.failUp = false
+        XCTAssertNil(commands.hostRoutes[endpoint])
+        XCTAssertFalse(journal.contains(endpoint))
+        XCTAssertTrue(running(splitID))
+    }
+
+    // MARK: adding
+
+    func testAFailedAddRefusesWithoutAdoptingOrDeletingAnything() throws {
+        ok(.up(tunnelID: splitID, config: split))
+        for refused in [CommandResult(status: 1, output: "route: writing to routing socket: File exists"), CommandResult(status: 1, output: "route: writing to routing socket: Network is unreachable")] {
+            commands.routeAddResult = refused
+            let before = upCount
+            let error = try XCTUnwrap(engine.handle(.up(tunnelID: fullID, config: full)).error)
+            XCTAssertEqual(upCount, before, "no spawn")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: paths.runtimeDir.appendingPathComponent("wn1.conf").path))
+            XCTAssertTrue(error.contains("No protective route was added"), error)
+            XCTAssertTrue(deletes.isEmpty, "a failed add is never cleaned up by deleting")
+            XCTAssertFalse(journal.contains(endpoint))
+        }
+    }
+
+    func testATimedOutAddIsUnprovenAndItsRowIsSettledByTheRollback() throws {
+        ok(.up(tunnelID: splitID, config: split))
+        commands.routeAddResult = CommandResult(status: 124, output: "Timed out")
+        var error = try XCTUnwrap(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        XCTAssertFalse(error.contains("No protective route was added"), error)
+        XCTAssertTrue(deletes.isEmpty, "the table shows it never happened")
+        XCTAssertFalse(journal.contains(endpoint), "and that is affirmative, so nothing is left to track")
+        XCTAssertEqual(upCount, 1)
+
+        // Here it did happen before the deadline. The row was absent when intent was journaled, so it is ours.
+        commands.onRouteChange = { [unowned self] verb in
+            if verb == "add" { self.commands.hostRoutes[self.endpoint] = "\(self.endpoint)     192.168.86.1     UGHS     en0\n" }
+        }
+        error = try XCTUnwrap(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        XCTAssertEqual(upCount, 1, "an unconfirmed add never lets the default start")
+        XCTAssertEqual(deletes, [["-q", "-n", "delete", "-inet", endpoint, "192.168.86.1"]])
+        XCTAssertNil(commands.hostRoutes[endpoint])
+    }
+
+    func testATimedOutAddStaysTrackedWhileTheTableCannotBeRead() throws {
+        ok(.up(tunnelID: splitID, config: split))
+        commands.routeAddResult = CommandResult(status: 124, output: "Timed out")
+        commands.onRouteChange = { [unowned self] _ in self.commands.netstatResult = CommandResult(status: 1, output: "") }
+        XCTAssertNotNil(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        XCTAssertTrue(journal.contains(endpoint), "not erased")
+        XCTAssertTrue(deletes.isEmpty)
+    }
+
+    func testAnAddThatInstallsTheWrongRowIsNeitherKeptNorDeleted() throws {
+        ok(.up(tunnelID: splitID, config: split))
+        commands.routeAddInstalls = "\(endpoint)     192.168.86.9     UGHS     en0\n"
+        let error = try XCTUnwrap(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        XCTAssertFalse(error.contains("No protective route was added"), "an add did run")
+        XCTAssertTrue(deletes.isEmpty, "the row is not one we can prove is ours")
+        XCTAssertFalse(journal.contains(endpoint))
+        XCTAssertEqual(upCount, 1, "only the split started")
+    }
+
+    func testAnUnreadableTableChangesNothing() {
+        ok(.up(tunnelID: splitID, config: split))
+        let unusable = [
+            CommandResult(status: 1, output: ""), CommandResult(status: 124, output: ""), CommandResult(status: 0, output: "no table"),
+            CommandResult(status: 0, output: commands.netstatBase + "broken\n"),
+            CommandResult(status: 0, output: commands.netstatBase + String(repeating: "x", count: HelperConstants.maxCommandOutputBytes)),
+        ]
+        for table in unusable {
+            commands.netstatResult = table
+            XCTAssertNotNil(engine.handle(.up(tunnelID: fullID, config: full)).error, table.output)
+            XCTAssertTrue(commands.routeChanges.isEmpty, table.output)
+            XCTAssertEqual(upCount, 1, table.output)
+        }
+    }
+
+    func testAnUnusableGatewayChangesNothing() {
+        ok(.up(tunnelID: splitID, config: split))
+        let lan = commands.netstatBase
+        for table in [lan.replacingOccurrences(of: "UGScg                 en0", with: "UGScg                 utun3"),
+                      lan + "default            192.168.90.1       UGScg                 en1\n",
+                      lan.replacingOccurrences(of: "192.168.86.1 ", with: "link#7       "),
+                      lan.replacingOccurrences(of: "192.168.86.1 ", with: "192.168.99.1 ")] {
+            commands.netstatBase = table
+            XCTAssertNotNil(engine.handle(.up(tunnelID: fullID, config: full)).error, table)
+            XCTAssertTrue(commands.routeChanges.isEmpty, table)
+            XCTAssertEqual(upCount, 1, table)
+        }
+    }
+
+    // MARK: rows that are not ours
+
+    func testAnExactPredatedRowIsBorrowedAndNeverDeleted() {
+        commands.hostRoutes[endpoint] = "\(endpoint)     192.168.86.1     UGHS     en0\n"
+        startPair()
+        XCTAssertTrue(running(fullID))
+        XCTAssertTrue(adds.isEmpty)
+        XCTAssertFalse(journal.contains(endpoint), "borrowed, not owned")
+        ok(.downAll)
+        XCTAssertTrue(deletes.isEmpty)
+        XCTAssertNotNil(commands.hostRoutes[endpoint], "still there, as it was found")
+    }
+
+    func testADifferentOrCoveringRowRefusesWithoutOverwriting() {
+        ok(.up(tunnelID: splitID, config: split))
+        let lan = commands.netstatBase
+        commands.hostRoutes[endpoint] = "\(endpoint)     192.168.86.9     UGHS     en0\n"
+        XCTAssertNotNil(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        XCTAssertTrue(commands.routeChanges.isEmpty)
+        XCTAssertEqual(commands.hostRoutes[endpoint], "\(endpoint)     192.168.86.9     UGHS     en0\n")
+
+        commands.hostRoutes[endpoint] = nil
+        commands.netstatBase = lan + "203.0.113/24       192.168.86.9       UGSc                  en0\n"
+        XCTAssertNotNil(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        XCTAssertTrue(commands.routeChanges.isEmpty)
+    }
+
+    func testAClonedRowIsOnlyEverGivenASafeAdd() throws {
+        let clone = "\(endpoint)     192.168.86.1     UGHWIig     en0\n"
+        ok(.up(tunnelID: splitID, config: split))
+        commands.hostRoutes[endpoint] = clone
+        commands.cloneBlocksRouteAdd = true
+        let error = try XCTUnwrap(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        XCTAssertTrue(error.contains(endpoint))
+        XCTAssertTrue(deletes.isEmpty, "a clone is never deleted to force the add")
+        XCTAssertEqual(commands.hostRoutes[endpoint], clone)
+
+        commands.cloneBlocksRouteAdd = false
+        ok(.up(tunnelID: fullID, config: full))
+        XCTAssertTrue(running(fullID))
+        XCTAssertTrue(journal.contains("installed"))
+    }
+
+    // MARK: while it runs
+
+    func testAnExternallyDeletedRouteIsAddedBackUnderTheSameChecks() {
+        startPair()
+        commands.hostRoutes[endpoint] = nil
+        XCTAssertTrue(running(fullID))
+        XCTAssertNotNil(commands.hostRoutes[endpoint])
+        XCTAssertEqual(adds.count, 2)
+    }
+
+    func testAForeignReplacementIsReleasedWithoutDeletingAndStopsOnlyTheDefault() {
+        startPair()
+        let foreign = "\(endpoint)     192.168.86.9     UGHS     en0\n"
+        commands.hostRoutes[endpoint] = foreign
+        let after = status
+        XCTAssertFalse(after.tunnels.contains { $0.tunnelID == fullID })
+        XCTAssertTrue(after.tunnels.contains { $0.tunnelID == splitID && $0.alive })
+        XCTAssertTrue(deletes.isEmpty)
+        XCTAssertEqual(commands.hostRoutes[endpoint], foreign)
+        XCTAssertFalse(journal.contains("\"\(endpoint)\""))
+    }
+
+    func testAGatewayChangeStopsTheDefaultBeforeTheOldRouteIsTouched() {
+        startPair()
+        var fullStoppedBeforeDelete: Bool?
+        commands.onRouteChange = { [unowned self] verb in
+            if verb == "delete" { fullStoppedBeforeDelete = self.commands.slots["wn1"] == nil }
+        }
+        commands.netstatBase = commands.netstatBase.replacingOccurrences(of: "192.168.86.1 ", with: "192.168.86.2 ")
+        let after = status
+        XCTAssertFalse(after.tunnels.contains { $0.tunnelID == fullID }, "contained")
+        XCTAssertTrue(after.tunnels.contains { $0.tunnelID == splitID && $0.alive })
+        XCTAssertEqual(fullStoppedBeforeDelete, true)
+        XCTAssertEqual(deletes, [["-q", "-n", "delete", "-inet", endpoint, "192.168.86.1"]], "the old gateway's exact row")
+        XCTAssertNil(commands.hostRoutes[endpoint])
+
+        ok(.up(tunnelID: fullID, config: full))
+        XCTAssertEqual(adds.last, ["-q", "-n", "add", "-inet", endpoint, "-gateway", "192.168.86.2"], "a retry validates the new one from scratch")
+    }
+
+    func testAnUnknownGatewayKeepsTheRouteAndStopsTheDefault() {
+        startPair()
+        commands.netstatBase = commands.netstatBase.replacingOccurrences(of: "default            192.168.86.1       UGScg                 en0\n", with: "")
+        let after = status
+        XCTAssertFalse(after.tunnels.contains { $0.tunnelID == fullID })
+        XCTAssertTrue(after.tunnels.contains { $0.tunnelID == splitID && $0.alive })
+    }
+
+    func testAnUnreadableTableKeepsTheJournalAndStopsTheDefault() {
+        startPair()
+        commands.netstatResult = CommandResult(status: 124, output: "")
+        XCTAssertNotNil(status.routeFailure)
+        XCTAssertNil(commands.slots["wn1"])
+        XCTAssertNotNil(commands.slots["wn0"])
+        XCTAssertTrue(deletes.isEmpty)
+        XCTAssertTrue(journal.contains(endpoint), "cleanup debt stays recorded")
+
+        commands.netstatResult = nil
+        XCTAssertNil(status.routeFailure)
+        XCTAssertNil(commands.hostRoutes[endpoint])
+        XCTAssertFalse(journal.contains(endpoint))
+    }
+
+    func testSameConfigUpChecksTheRouteAgain() {
+        startPair()
+        commands.hostRoutes[endpoint] = "\(endpoint)     192.168.86.9     UGHS     en0\n"
+        XCTAssertNotNil(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        XCTAssertNil(commands.slots["wn1"])
+    }
+
+    // MARK: endpoints
+
+    func testRoamingMovesTheRouteToTheRealEndpoint() {
+        startPair()
+        commands.actualEndpoints["wn0"] = "\(testKey(2))\t203.0.113.7:12345\n"
+        XCTAssertTrue(running(fullID))
+        XCTAssertNotNil(commands.hostRoutes["203.0.113.7"])
+        XCTAssertNil(commands.hostRoutes[endpoint])
+    }
+
+    /// Unknown must not read as "nobody needs it": the route stays until the capture it protects from has really gone.
+    func testAnEndpointThatCannotBeReadStopsTheDefaultBeforeItsRouteIsTouched() {
+        let unreadable: [(String, () -> Void)] = [
+            ("(none)", { self.commands.actualEndpoints["wn0"] = "\(testKey(2))\t(none)\n" }),
+            ("garbage", { self.commands.actualEndpoints["wn0"] = "garbage\n" }),
+            ("timeout", { self.commands.wgShowTimeouts = ["endpoints"] }),
+        ]
+        for (label, makeUnreadable) in unreadable {
+            startPair()
+            var fullGoneAtDelete: Bool?
+            commands.onRouteChange = { [unowned self] verb in
+                if verb == "delete" { fullGoneAtDelete = self.commands.slots["wn1"] == nil }
+            }
+            makeUnreadable()
+            let after = status
+            XCTAssertFalse(after.tunnels.contains { $0.tunnelID == fullID }, label)
+            XCTAssertTrue(after.tunnels.contains { $0.tunnelID == splitID }, label)
+            XCTAssertNotNil(commands.slots["wn0"], label)
+            XCTAssertEqual(fullGoneAtDelete, true, label)
+
+            commands.onRouteChange = nil
+            commands.actualEndpoints["wn0"] = nil
+            commands.wgShowTimeouts = []
+            ok(.downAll)
+        }
+    }
+
+    func testAnExposedIPv6EndpointStillFailsClosedAndNoV6RouteRuns() {
+        startPair()
+        commands.actualEndpoints["wn0"] = "\(testKey(2))\t[2001:db8::9]:12345\n"
+        XCTAssertFalse(status.tunnels.contains { $0.tunnelID == fullID })
+        XCTAssertFalse(commands.routeChanges.contains { $0.contains("2001:db8::9") })
+    }
+
+    func testAnOnLinkOrInvalidEndpointNeverGetsARoute() {
+        let onLink = confText(address: "10.20.0.2/32", allowedIPs: "192.168.111.0/24", endpoint: "192.168.86.77:12345")
+        commands.routeGet["192.168.86.77"] = CommandResult(status: 1, output: "not in table")
+        ok(.up(tunnelID: splitID, config: onLink))
+        XCTAssertNotNil(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        XCTAssertTrue(commands.routeChanges.isEmpty)
+        ok(.downAll)
+
+        let loopback = confText(address: "10.20.0.2/32", allowedIPs: "192.168.111.0/24", endpoint: "127.77.0.9:12345")
+        ok(.up(tunnelID: splitID, config: loopback))
+        XCTAssertNotNil(engine.handle(.up(tunnelID: fullID, config: full)).error)
+        XCTAssertTrue(commands.routeChanges.isEmpty)
+    }
+
+    // MARK: the default owner's own endpoint is wg-quick's
+
+    private lazy var sharedFull = confText(address: "10.128.0.2/32", allowedIPs: "0.0.0.0/0", endpoint: "\(endpoint):1637")
+
+    func testASharedEndpointIsBorrowedFromWgQuickInBothOrders() {
+        commands.wgQuickManagesOwnEndpoint = true
+        ok(.up(tunnelID: splitID, config: split))
+        ok(.up(tunnelID: fullID, config: sharedFull))
+        XCTAssertTrue(running(fullID))
+        XCTAssertTrue(commands.routeChanges.isEmpty, "the helper neither adds nor owns it")
+
+        ok(.down(tunnelID: fullID))
+        XCTAssertNil(commands.hostRoutes[endpoint], "wg-quick took its own route away")
+        XCTAssertTrue(running(splitID))
+        ok(.downAll)
+
+        ok(.up(tunnelID: fullID, config: sharedFull))
+        ok(.up(tunnelID: splitID, config: split))
+        XCTAssertTrue(running(splitID))
+        ok(.down(tunnelID: splitID))
+        XCTAssertNotNil(commands.hostRoutes[endpoint], "stopping the split must not take the full tunnel's endpoint route")
+        XCTAssertTrue(running(fullID))
+        XCTAssertTrue(commands.routeChanges.isEmpty)
+    }
+
+    func testOurRouteIsKeptWhileTheDefaultOwnerHasRoamedOntoIt() {
+        startPair()
+        commands.actualEndpoints["wn1"] = "\(testKey(2))\t\(endpoint):1637\n"
+        ok(.down(tunnelID: splitID))
+        XCTAssertTrue(deletes.isEmpty, "the full tunnel would be left captured by itself")
+        XCTAssertNotNil(commands.hostRoutes[endpoint])
+        XCTAssertTrue(journal.contains(endpoint), "not forgotten either")
+
+        ok(.down(tunnelID: fullID))
+        XCTAssertEqual(deletes.count, 1)
+        XCTAssertNil(commands.hostRoutes[endpoint])
+    }
+
+    // MARK: removal
+
+    func testAFailedDeleteStaysTrackedVisibleAndRetried() throws {
+        startPair()
+        commands.routeDeleteResult = CommandResult(status: 1, output: "route: writing to routing socket: Operation not permitted")
+        XCTAssertNotNil(engine.handle(.downAll).error, "uninstall must not pass over this")
+        XCTAssertNotNil(status.routeFailure)
+        XCTAssertTrue(journal.contains(endpoint))
+
+        commands.routeDeleteResult = nil
+        ok(.downAll)
+        XCTAssertNil(commands.hostRoutes[endpoint])
+        XCTAssertFalse(journal.contains(endpoint))
+    }
+
+    func testADeleteThatExitsZeroButLeavesTheRowIsNotSuccess() {
+        startPair()
+        commands.routeDeleteLeavesRow = true
+        XCTAssertNotNil(engine.handle(.downAll).error)
+        XCTAssertTrue(journal.contains(endpoint))
+    }
+
+    func testAChangedRowIsNeverDeleted() {
+        startPair()
+        let foreign = "\(endpoint)     192.168.86.9     UGHS     en0\n"
+        commands.hostRoutes[endpoint] = foreign
+        ok(.down(tunnelID: fullID))
+        XCTAssertEqual(commands.hostRoutes[endpoint], foreign)
+        XCTAssertTrue(deletes.isEmpty)
+        XCTAssertFalse(journal.contains("\"\(endpoint)\""), "affirmatively someone else's, so ownership ends")
+    }
+
+    func testAnUnknownTableDuringTeardownRetainsCleanupDebt() {
+        startPair()
+        commands.netstatResult = CommandResult(status: 1, output: "")
+        XCTAssertNotNil(engine.handle(.downAll).error)
+        XCTAssertTrue(deletes.isEmpty)
+        XCTAssertTrue(journal.contains(endpoint))
+        XCTAssertNotNil(commands.hostRoutes[endpoint])
+
+        commands.netstatResult = nil
+        ok(.downAll)
+        XCTAssertNil(commands.hostRoutes[endpoint])
+    }
+
+    func testARetiringDefaultOwnerWithItsInterfaceLeftKeepsTheRoute() {
+        startPair()
+        commands.downLeavesInterfaceOnly = true
+        XCTAssertNotNil(engine.handle(.down(tunnelID: fullID)).error)
+        XCTAssertTrue(deletes.isEmpty, "its routes may still be installed")
+        XCTAssertNotNil(commands.hostRoutes[endpoint])
+    }
+
+    func testAnUnknownInterfaceKeepsTheRoute() {
+        startPair()
+        commands.downLeavesInterfaceOnly = true
+        commands.ifconfigEnumeration = CommandResult(status: 1, output: "")
+        XCTAssertNotNil(engine.handle(.down(tunnelID: fullID)).error)
+        XCTAssertTrue(deletes.isEmpty)
+        XCTAssertTrue(journal.contains(endpoint))
+    }
+
+    // MARK: crashes
+
+    private func journalAtFirst(_ verb: String, while action: () -> Void) throws -> Data {
+        var captured: Data?
+        commands.onRouteChange = { [unowned self] seen in
+            if seen == verb, captured == nil { captured = try? Data(contentsOf: self.journalURL) }
+        }
+        action()
+        commands.onRouteChange = nil
+        return try XCTUnwrap(captured)
+    }
+
+    func testCrashWhileAddingBeforeTheRowExistsLeavesNothingBehind() throws {
+        ok(.up(tunnelID: splitID, config: split))
+        let atAdd = try journalAtFirst("add") { ok(.up(tunnelID: fullID, config: full)) }
+        ok(.down(tunnelID: fullID))
+        try atAdd.write(to: journalURL)
+        XCTAssertTrue(String(decoding: atAdd, as: UTF8.self).contains("adding"))
+
+        let recovered = try restarted()
+        XCTAssertNil(recovered.handle(.status).status?.routeFailure)
+        XCTAssertFalse(journal.contains(endpoint))
+        XCTAssertEqual(deletes.count, 1, "only the earlier real stop")
+    }
+
+    func testCrashWhileAddingAfterTheRowExistsRemovesIt() throws {
+        ok(.up(tunnelID: splitID, config: split))
+        let atAdd = try journalAtFirst("add") { ok(.up(tunnelID: fullID, config: full)) }
+        commands.slots["wn1"] = nil
+        try atAdd.write(to: journalURL)
+        XCTAssertNotNil(commands.hostRoutes[endpoint])
+
+        _ = try restarted()
+        XCTAssertNil(commands.hostRoutes[endpoint], "no capturing tunnel, so no reason to keep it")
+        XCTAssertFalse(journal.contains(endpoint))
+        XCTAssertNotNil(commands.slots["wn0"])
+    }
+
+    func testCrashWhileRemovingFinishesAndAnUnknownTableWaits() throws {
+        startPair()
+        let atDelete = try journalAtFirst("delete") { ok(.down(tunnelID: fullID)) }
+        XCTAssertTrue(String(decoding: atDelete, as: UTF8.self).contains("removing"))
+        commands.hostRoutes[endpoint] = "\(endpoint)     192.168.86.1     UGHS     en0\n"
+        try atDelete.write(to: journalURL)
+
+        commands.netstatResult = CommandResult(status: 1, output: "")
+        _ = try restarted()
+        XCTAssertTrue(journal.contains(endpoint), "unknown is not gone")
+        XCTAssertNotNil(commands.hostRoutes[endpoint])
+
+        commands.netstatResult = nil
+        _ = try restarted()
+        XCTAssertNil(commands.hostRoutes[endpoint])
+        XCTAssertFalse(journal.contains(endpoint))
+    }
+
+    func testRecoveryAdoptsThePairWithItsRoute() throws {
+        startPair()
+        let recovered = try restarted()
+        XCTAssertEqual(recovered.handle(.status).status?.tunnels.count, 2)
+        XCTAssertNotNil(commands.hostRoutes[endpoint])
+        XCTAssertEqual(deletes.count, 0)
+        XCTAssertEqual(adds.count, 1, "no duplicate route")
+    }
+}
+
 final class FullLANRootTests: XCTestCase {
     private var paths: HelperPaths!
     private var commands: FakeCommands!

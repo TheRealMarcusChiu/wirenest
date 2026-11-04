@@ -31,6 +31,32 @@ final class FakeCommands: CommandRunning {
     var wgShowTimeouts: Set<String> = []
     /// Replaces a narrow route's netstat destination. An empty string leaves that route out of the table.
     var narrowRowDestination: [String: String] = [:]
+    /// Host rows besides the slots' own, keyed by destination and written as netstat prints them.
+    var hostRoutes: [String: String] = [:]
+    /// Returned by `route add` instead of adding, for a refused or timed out command.
+    var routeAddResult: CommandResult?
+    /// Installed by a `route add` that exits 0, in place of the row it asked for.
+    var routeAddInstalls: String?
+    /// Whether the kernel refuses to replace a cloned row. Nothing here assumes which way a real one goes.
+    var cloneBlocksRouteAdd = false
+    var routeDeleteResult: CommandResult?
+    var routeDeleteLeavesRow = false
+    /// Replaces the whole `netstat` result, for a failed, cut or malformed table.
+    var netstatResult: CommandResult?
+    /// Stock wg-quick pins a default-route tunnel's own numeric endpoint on `up` and deletes it on `down`.
+    var wgQuickManagesOwnEndpoint = false
+    /// Called with `add` or `delete` before each route change, while the journal can still be read as it was.
+    var onRouteChange: ((String) -> Void)?
+
+    var routeChanges: [[String]] { calls.filter { $0.executable == "/sbin/route" && $0.args.first == "-q" }.map { $0.args } }
+
+    private func ownEndpoints(of config: WireGuardConfig?) -> [String] {
+        guard let config, config.peers.flatMap(\.allowedIPs).contains(where: { $0.isDefaultRoute && !$0.isIPv6 }) else { return [] }
+        return config.peers.compactMap { peer in
+            guard let host = peer.endpoint?.host, CIDR(host) != nil else { return nil }
+            return host
+        }
+    }
 
     func installSyntheticLAN() {
         netstatBase = """
@@ -132,11 +158,17 @@ final class FakeCommands: CommandRunning {
                 slot.config = (try? String(contentsOfFile: conf, encoding: .utf8)).flatMap { try? WireGuardConfig.parse($0) }
                 slot.defaultRowsAtPause = pauses + defaultRowsAppearAfterPauses
                 slots[name] = slot
+                if wgQuickManagesOwnEndpoint {
+                    for host in ownEndpoints(of: slot.config) { hostRoutes[host] = "\(host)     192.168.86.1     UGHS     en0\n" }
+                }
                 nextUtun += 1
                 return CommandResult(status: 0, output: "[+] Backgrounding route monitor")
             }
             if failDown { return CommandResult(status: 1, output: "cannot remove") }
             guard let slot = slots[name] else { return CommandResult(status: 1, output: "not a WireGuard interface") }
+            if wgQuickManagesOwnEndpoint {
+                for host in ownEndpoints(of: slot.config) { hostRoutes[host] = nil }
+            }
             try? FileManager.default.removeItem(at: nameFile)
             try? FileManager.default.removeItem(at: paths.wireguardRunDir.appendingPathComponent("\(slot.real).sock"))
             if downLeavesDeviceAlive { return CommandResult(status: 0, output: "") }
@@ -166,8 +198,34 @@ final class FakeCommands: CommandRunning {
             default: return CommandResult(status: 1, output: "")
             }
         }
+        if executable == "/sbin/route", args.first == "-q" {
+            let endpoint = args[4]
+            onRouteChange?(args[2])
+            if args[2] == "add" {
+                if let routeAddResult { return routeAddResult }
+                if let existing = hostRoutes[endpoint], !existing.contains("UGHWI") || cloneBlocksRouteAdd {
+                    return CommandResult(status: 1, output: "route: writing to routing socket: File exists")
+                }
+                hostRoutes[endpoint] = routeAddInstalls ?? "\(endpoint)     \(args[6])     UGHS     en0\n"
+                return CommandResult(status: 0, output: "")
+            }
+            if let routeDeleteResult { return routeDeleteResult }
+            if !routeDeleteLeavesRow { hostRoutes[endpoint] = nil }
+            return CommandResult(status: 0, output: "")
+        }
         if executable == "/sbin/route" {
             let address = args.last ?? ""
+            if let row = hostRoutes[address] {
+                let fields = row.split(whereSeparator: \.isWhitespace).map(String.init)
+                let flags = fields[2].contains("W") ? "UP,GATEWAY,HOST,DONE,WASCLONED,IFSCOPE" : "UP,GATEWAY,HOST,DONE,STATIC"
+                return CommandResult(status: 0, output: """
+                   route to: \(address)
+                destination: \(address)
+                    gateway: \(fields[1])
+                  interface: \(fields[3])
+                      flags: <\(flags)>
+                """)
+            }
             if let scripted = routeGet[address] { return scripted }
             if let name = slotName(forRoute: address), let real = slots[name]?.real {
                 return CommandResult(status: 0, output: "   route to: \(address)\n  interface: \(real)\n      flags: <UP,DONE,STATIC>\n")
@@ -175,6 +233,7 @@ final class FakeCommands: CommandRunning {
             return CommandResult(status: 1, output: "route: writing to routing socket: not in table")
         }
         if executable == "/usr/sbin/netstat" {
+            if let netstatResult { return netstatResult }
             let rows = slots.values.filter { slot in
                 pauses >= slot.defaultRowsAtPause && slot.config?.table != .off
                     && slot.config?.peers.flatMap(\.allowedIPs).contains { $0.isDefaultRoute && !$0.isIPv6 } == true
@@ -186,7 +245,7 @@ final class FakeCommands: CommandRunning {
                     return destination.isEmpty ? nil : "\(destination)     \(slot.real)     USc     \(slot.real)\n"
                 }
             }
-            return CommandResult(status: 0, output: netstatBase + rows.joined() + narrow.joined())
+            return CommandResult(status: 0, output: netstatBase + rows.joined() + narrow.joined() + hostRoutes.keys.sorted().compactMap { hostRoutes[$0] }.joined())
         }
         if executable == "/usr/sbin/networksetup", args == ["-listallhardwareports"] {
             return CommandResult(status: 0, output: hardwarePorts)
