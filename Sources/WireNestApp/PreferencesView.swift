@@ -361,19 +361,20 @@ private struct RulesTab: View {
 
     private var canAdd: Bool {
         guard profileID != nil else { return false }
-        if kind == .publicIPChanges { return true }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
-        return kind != .publicIP || CIDR(trimmed) != nil
+        switch kind {
+        case .publicIPChanges: return true
+        case .publicIP: return CIDR(value.trimmingCharacters(in: .whitespacesAndNewlines)) != nil
+        case .ssidEquals, .ssidNotEquals: return !value.isEmpty
+        }
     }
 
     private func add() {
         guard let profileID else { return }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Network names are used exactly as typed: spaces are real SSID bytes.
         switch kind {
-        case .ssidEquals: controller.addRule(.ssidEquals(trimmed), profileID: profileID)
-        case .ssidNotEquals: controller.addRule(.ssidNotEquals(trimmed), profileID: profileID)
-        case .publicIP: controller.addRule(.publicIPInRange(trimmed), profileID: profileID)
+        case .ssidEquals: controller.addRule(.ssidEquals(value), profileID: profileID)
+        case .ssidNotEquals: controller.addRule(.ssidNotEquals(value), profileID: profileID)
+        case .publicIP: controller.addRule(.publicIPInRange(value.trimmingCharacters(in: .whitespacesAndNewlines)), profileID: profileID)
         case .publicIPChanges: controller.addRule(.publicIPChanges, profileID: profileID)
         }
         value = ""

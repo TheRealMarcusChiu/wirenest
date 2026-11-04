@@ -8,11 +8,128 @@ final class RuleEngineTests: XCTestCase {
     private func makeState(ordered: [(RuleCondition, UUID)] = []) -> AppState {
         var state = AppState()
         state.profiles = [
-            ConnectionProfile(id: home, name: "Home"),
-            ConnectionProfile(id: away, name: "Away"),
+            ConnectionProfile(id: home, name: "Home", tunnels: [SavedTunnel(name: "h", enabled: true, configText: confText())]),
+            ConnectionProfile(id: away, name: "Away", tunnels: [SavedTunnel(name: "a", enabled: true, configText: confText())]),
         ]
         state.rules = ordered.map { NetworkRule(condition: $0.0, profileID: $0.1) }
         return state
+    }
+
+    /// The same steps as `AppController.applyRules`: nothing is committed unless the connect succeeds.
+    @discardableResult
+    private func applyRules(_ engine: inout RuleEngine, _ state: inout AppState, _ snap: NetworkSnapshot, at now: Date) throws -> UUID? {
+        var updated = state
+        let target = engine.evaluate(state: &updated, snapshot: snap, now: now)
+        if let target { try updated.connect(target, pinContext: updated.pinnedContext, ssid: snap.ssid) }
+        state = updated
+        return target
+    }
+
+    private func settledRules(_ engine: inout RuleEngine, _ state: inout AppState, _ snap: NetworkSnapshot, at start: Date) throws -> UUID? {
+        let settledAt = start.addingTimeInterval(engine.debounce)
+        try applyRules(&engine, &state, snap, at: start)
+        return try applyRules(&engine, &state, snap, at: settledAt)
+    }
+
+    private func makeTargetUnusable(_ state: inout AppState, _ how: String) {
+        switch how {
+        case "empty":
+            state.profiles[1].tunnels = []
+        case "invalid":
+            state.profiles[1].tunnels[0].configText = "not a config"
+        default:
+            state.profiles[1].tunnels = [
+                SavedTunnel(name: "x", enabled: true, configText: confText(address: "10.1.0.2/32", allowedIPs: "10.0.0.0/8")),
+                SavedTunnel(name: "y", enabled: true, configText: confText(address: "192.168.9.2/32", allowedIPs: "10.2.0.0/24")),
+            ]
+        }
+    }
+
+    private let unusableTargets = ["empty", "invalid", "conflicting"]
+
+    // MARK: switch transactions
+
+    func testChangeOntoUnusableTargetChangesNothingAndReportsWhy() throws {
+        for how in unusableTargets {
+            var state = makeState(ordered: [(.publicIPChanges, away)])
+            state.publicIPAutomationEnabled = true
+            state.activeProfileID = home
+            state.connectionOn = true
+            makeTargetUnusable(&state, how)
+            var engine = RuleEngine()
+            _ = try settledRules(&engine, &state, NetworkSnapshot(ssid: .known("Net"), publicIP: "203.0.113.1"), at: t0)
+            let before = state
+
+            let changed = NetworkSnapshot(ssid: .known("Net"), publicIP: "198.51.100.1")
+            XCTAssertNil(try settledRules(&engine, &state, changed, at: t0.addingTimeInterval(100)), how)
+            XCTAssertEqual(state, before, "\(how): no new pin, no change of connection or intent")
+            XCTAssertNil(state.pinnedContext, how)
+            XCTAssertNotNil(engine.targetProblem, "\(how): the reason stays visible")
+        }
+    }
+
+    func testFixingTheTargetLetsThePendingChangeFireWithoutDwellPenalty() throws {
+        var state = makeState(ordered: [(.publicIPChanges, away)])
+        state.publicIPAutomationEnabled = true
+        state.activeProfileID = home
+        state.connectionOn = true
+        let working = state.profiles[1].tunnels
+        makeTargetUnusable(&state, "empty")
+        var engine = RuleEngine()
+        _ = try settledRules(&engine, &state, NetworkSnapshot(ssid: .known("Net"), publicIP: "203.0.113.1"), at: t0)
+        let changed = NetworkSnapshot(ssid: .known("Net"), publicIP: "198.51.100.1")
+        _ = try settledRules(&engine, &state, changed, at: t0.addingTimeInterval(100))
+
+        state.profiles[1].tunnels = working
+        XCTAssertEqual(try settledRules(&engine, &state, changed, at: t0.addingTimeInterval(110)), away)
+        XCTAssertNil(engine.targetProblem)
+        XCTAssertEqual(state.activeProfileID, away)
+        XCTAssertNotNil(state.pinnedContext, "a successful switch keeps its hold")
+    }
+
+    func testUnusableTargetFallsThroughToALowerRuleWithoutAHoldPin() throws {
+        for how in unusableTargets {
+            let elsewhere = UUID()
+            var state = makeState(ordered: [(.publicIPChanges, away), (.ssidEquals("Net"), home)])
+            state.profiles.append(ConnectionProfile(id: elsewhere, name: "Elsewhere"))
+            state.publicIPAutomationEnabled = true
+            state.activeProfileID = elsewhere
+            state.connectionOn = true
+            makeTargetUnusable(&state, how)
+            var engine = RuleEngine()
+            // Keep the baseline step from switching, so the fallback below is the change's own effect.
+            state.rules[1].enabled = false
+            _ = try settledRules(&engine, &state, NetworkSnapshot(ssid: .known("Net"), publicIP: "203.0.113.1"), at: t0)
+            state.rules[1].enabled = true
+
+            let changed = NetworkSnapshot(ssid: .known("Net"), publicIP: "198.51.100.1")
+            XCTAssertEqual(try settledRules(&engine, &state, changed, at: t0.addingTimeInterval(100)), home, how)
+            XCTAssertEqual(state.activeProfileID, home, how)
+            XCTAssertNil(state.pinnedContext, "\(how): the failed change rule must not hold the fallback")
+        }
+    }
+
+    func testUnusableTargetOfAnSSIDRuleFallsThroughAndDoesNotConsumeDwell() throws {
+        for how in unusableTargets {
+            var state = makeState(ordered: [(.ssidEquals("Net"), away), (.ssidEquals("Net"), home)])
+            makeTargetUnusable(&state, how)
+            var engine = RuleEngine()
+            XCTAssertEqual(try settledRules(&engine, &state, NetworkSnapshot(ssid: .known("Net")), at: t0), home, how)
+            XCTAssertNotNil(engine.targetProblem, how)
+            XCTAssertFalse(state.manualOff, how)
+        }
+    }
+
+    func testUnusableTargetAloneStartsNoDwell() throws {
+        var state = makeState(ordered: [(.ssidEquals("Net"), away), (.ssidEquals("Other"), home)])
+        let working = state.profiles[1].tunnels
+        makeTargetUnusable(&state, "empty")
+        var engine = RuleEngine()
+        XCTAssertNil(try settledRules(&engine, &state, NetworkSnapshot(ssid: .known("Net")), at: t0))
+        XCTAssertNil(state.activeProfileID)
+
+        state.profiles[1].tunnels = working
+        XCTAssertEqual(try settledRules(&engine, &state, NetworkSnapshot(ssid: .known("Net")), at: t0.addingTimeInterval(6)), away, "inside the dwell a real switch would have started")
     }
 
     /// Evaluates twice across the debounce window, the way the periodic tick does.

@@ -7,11 +7,11 @@ architecture, the contract with packaging, and what has and has not been verifie
 ## Verification status
 
 No Swift toolchain exists on the host where this code was written, so tests were written first but RED
-could not be observed. The integration coordinator reports that an earlier candidate passed macOS CI,
-including its tests and a sidecar two-tunnel run, but that run did not exercise the root helper path. The
-later network-policy and helper-lifecycle repairs have not been compiled or run. Treat those behaviors,
-and everything that depends on the helper, as designed and not proven until macOS CI, the authenticated
-helper proof below and hands-on testing pass.
+could not be observed. The integration coordinator reports that candidates up to the first network-policy
+repair passed macOS CI, including tests and a sidecar two-tunnel run, but those runs did not exercise the
+root helper path. The helper-lifecycle repair and later policy fixes have not been compiled or run. Treat
+those behaviors, and everything that depends on the helper, as designed and not proven until macOS CI, the
+authenticated helper proof below and hands-on testing pass.
 
 ## Targets
 
@@ -136,8 +136,12 @@ There is deliberately no exception for a full tunnel beside a split tunnel. wg-q
 two `/1` routes, so longest-prefix match cannot decide against another `/1`, and each tunnel's wg-quick
 manages its endpoint routes alone.
 
-**Limits.** Hostname endpoints cannot be checked before resolution. Conflicts with routes outside
-WireNest are not detected.
+A hostname endpoint beside another tunnel's `/0` is refused in either family, because the name could
+resolve into that route. Only a numeric endpoint of the other family can prove it stays out. The root
+helper runs the same check.
+
+**Limits.** Hostname endpoints are not checked against narrower routes, since they cannot be resolved
+ahead of time. Conflicts with routes outside WireNest are not detected.
 
 ### SSID eligibility
 
@@ -150,7 +154,8 @@ the app re-reads the SSID before each `up`. On a disallowed network a connection
 with `manualOff` false, so it resumes when allowed. An explicit disconnect still wins. A manual connect
 on a disallowed network is refused with the reason, and rules skip disallowed targets.
 
-An unknown SSID (no Location permission, Wi-Fi off, Ethernet only) satisfies neither mode.
+An unknown SSID (no Location permission, Wi-Fi off, Ethernet only) satisfies neither mode. Names are
+stored and compared exactly as entered, limited to 1 to 32 bytes, because spaces are real SSID bytes.
 
 **Limits.** Enforcement lives in the app, not the helper, which cannot see the SSID, so tunnels already
 running stay up if the app is force quit. A Wi-Fi name that is briefly unavailable, for example on wake,
@@ -187,9 +192,10 @@ peers, and the monitor is running. Anything else rolls back.
 
 **Stop.** `wg-quick down` only removes the socket. wireguard-go and the utun then go, and only then does
 the route monitor notice, delete its routes and exit. The monitor's exit is therefore the proof of
-finished cleanup, and the slot and its config stay reserved until it has happened, with a 20 second limit.
-Past half of that, the helper does what `wg-quick` would (removes the socket) and sends SIGTERM to the
-monitor's process group, which runs its cleanup trap.
+finished cleanup, together with the utun being gone by `ifconfig`'s own "no such interface" answer. The
+slot and its config stay reserved until then, with a 20 second limit. Past half of that, the helper sends
+SIGTERM to the monitor's process group, which holds its wireguard-go and runs its cleanup trap. The helper
+never deletes a socket, as sockets are named by utun number and that number may have another owner by then.
 
 **Barrier.** A monitor outliving its tunnel would watch any tunnel that reuses its utun number and then
 delete that tunnel's routes, so no new tunnel starts while any teardown is unfinished. A failure stays
@@ -203,9 +209,12 @@ group is ever signalled, and each `wg-quick` has a group of its own. On start th
 `running` tunnels and finishes `starting`, `retiring` and dead ones. A `wnN.conf` with no journal entry is
 treated as an interrupted tunnel of ours. Nothing else in the directory is touched.
 
-**Limits.** Past the halfway point, a utun that `wg` cannot reach is assumed to be another app reusing
-the number, since utun numbers are shared, so a hung wireguard-go would pass as that. Endpoint host routes
-are deleted by the monitor's trap and are not independently verified.
+**Limits.** A utun that still exists is never treated as cleaned up, because its number alone does not prove
+who holds it. If another app takes the number before cleanup is confirmed, or a wireguard-go hangs with no
+monitor left, that teardown keeps failing visibly and new tunnels stay blocked until the utun is gone,
+for example when that app quits or after a reboot. This wait is deliberate: a false success could reuse a
+slot alongside a live tunnel. Endpoint host routes are deleted by the monitor's trap and are not
+independently verified.
 
 ### Health and recovery
 
@@ -260,6 +269,11 @@ survives failed probes, so failure followed by the same address is no change. Be
 memory, a change while the app is not running is not detected. The event stays pending through debounce
 and dwell. It is dropped by `manualOff`, a holding pin, a disallowed target, or a higher-priority rule.
 After it fires, a pin holds the choice until the network changes again, so lower rules cannot flip it back.
+
+A rule whose connection cannot start (no enabled tunnels, an invalid config, a route conflict) is skipped,
+and the UI shows why. It leaves no pin and uses no dwell time, and lower rules still apply. A public IP
+change whose only matching rule is blocked this way stays pending, so repairing that connection can still
+act on it. Other changes to saved state from a rule are committed only with a successful connect.
 
 ## Test map
 

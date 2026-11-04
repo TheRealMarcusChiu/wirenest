@@ -29,6 +29,8 @@ final class AppController: ObservableObject {
     /// Why the active connection cannot run as saved, e.g. a conflict.
     @Published private(set) var connectionError: String?
     @Published private(set) var dnsError: String?
+    /// Why a matching rule cannot use its connection right now.
+    @Published private(set) var ruleProblem: String?
     @Published private(set) var isBusy = false
 
     var showPreferences: () -> Void = {}
@@ -134,15 +136,23 @@ final class AppController: ObservableObject {
     private func applyRules() {
         var updated = state
         let target = ruleEngine.evaluate(state: &updated, snapshot: snapshot(), now: Date())
+        ruleProblem = ruleEngine.targetProblem
+        if let target {
+            // Keeps only a pin the engine just set; otherwise the next network change can move this connection again.
+            do {
+                try updated.connect(target, pinContext: updated.pinnedContext, ssid: ssid)
+            } catch {
+                notice = error.localizedDescription
+                return
+            }
+            supervisor.retryAll()
+            dnsDirty = true
+            notice = nil
+        }
+        // Committed as one, so a refused switch leaves no pin or other trace in the saved state.
         if updated != state {
             state = updated
             persist()
-        }
-        guard let target else { return }
-        // Keeps only a pin the engine just set; otherwise the next network change can move this connection again.
-        if mutate({ try $0.connect(target, pinContext: $0.pinnedContext, ssid: ssid) }) {
-            supervisor.retryAll()
-            dnsDirty = true
         }
     }
 

@@ -21,6 +21,10 @@ final class FakeCommands: CommandRunning {
     var upWithoutMonitor = false
     /// `wg-quick down` exits 0 but the device keeps answering.
     var downLeavesDeviceAlive = false
+    /// `wg-quick down` exits 0, `wg` can no longer reach the device and the monitor is gone, but the utun remains.
+    var downLeavesInterfaceOnly = false
+    /// `ifconfig` itself fails, which says nothing about the interface.
+    var ifconfigBroken = false
     var monitorExitPauses = 0
     var monitorIgnoresTerm = false
     var onQuick: ((String) -> Void)?
@@ -81,7 +85,9 @@ final class FakeCommands: CommandRunning {
             try? FileManager.default.removeItem(at: paths.wireguardRunDir.appendingPathComponent("\(slot.real).sock"))
             if downLeavesDeviceAlive { return CommandResult(status: 0, output: "") }
             slots[name]?.wgReachable = false
-            if monitorExitPauses == 0 {
+            if downLeavesInterfaceOnly {
+                slots[name]?.monitorAlive = false
+            } else if monitorExitPauses == 0 {
                 slots[name] = nil
             } else {
                 slots[name]?.pausesUntilGone = monitorExitPauses
@@ -99,6 +105,7 @@ final class FakeCommands: CommandRunning {
             }
         }
         if executable == "/sbin/ifconfig" {
+            if ifconfigBroken { return CommandResult(status: 124, output: "Timed out") }
             return CommandResult(status: slots.values.contains { $0.real == args[0] } ? 0 : 1, output: "")
         }
         if executable == "/usr/sbin/networksetup" {

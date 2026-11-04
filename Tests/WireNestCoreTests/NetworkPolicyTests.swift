@@ -26,11 +26,29 @@ final class SSIDEligibilityTests: XCTestCase {
 
     func testRejectsEmptyAndImpossibleSSIDs() throws {
         var (state, profile, _) = try restricted(nil)
-        XCTAssertThrowsError(try state.setSSIDEligibility(profile, .onlyEquals("   ")))
+        XCTAssertThrowsError(try state.setSSIDEligibility(profile, .onlyEquals("")))
         XCTAssertThrowsError(try state.setSSIDEligibility(profile, .onlyNotEquals(String(repeating: "x", count: 33))))
+        XCTAssertThrowsError(try state.setSSIDEligibility(profile, .onlyEquals(String(repeating: "é", count: 17))), "the limit is in bytes")
         XCTAssertNil(state.profile(profile)?.ssidEligibility)
+        try state.setSSIDEligibility(profile, .onlyEquals(String(repeating: "x", count: 32)))
+    }
+
+    func testSpacesAreRealSSIDBytesAndAreStoredAndComparedExactly() throws {
+        var (state, profile, _) = try restricted(nil)
+        try state.setSSIDEligibility(profile, .onlyNotEquals(" Home "))
+        XCTAssertEqual(state.profile(profile)?.ssidEligibility, .onlyNotEquals(" Home "))
+        XCTAssertNotNil(state.profile(profile)?.ineligibilityReason(.known(" Home ")), "the forbidden network stays forbidden")
+        XCTAssertNil(state.profile(profile)?.ineligibilityReason(.known("Home")), "a different name")
+        XCTAssertNotNil(state.profile(profile)?.ineligibilityReason(noWiFi))
+
         try state.setSSIDEligibility(profile, .onlyEquals(" Home "))
-        XCTAssertEqual(state.profile(profile)?.ssidEligibility, .onlyEquals("Home"))
+        XCTAssertEqual(state.profile(profile)?.ssidEligibility, .onlyEquals(" Home "))
+        XCTAssertNil(state.profile(profile)?.ineligibilityReason(.known(" Home ")))
+        XCTAssertNotNil(state.profile(profile)?.ineligibilityReason(.known("Home")))
+        XCTAssertNotNil(state.profile(profile)?.ineligibilityReason(noWiFi))
+
+        try state.setSSIDEligibility(profile, .onlyEquals("   "))
+        XCTAssertEqual(state.profile(profile)?.ssidEligibility, .onlyEquals("   "), "only spaces is still a legal name")
     }
 
     func testManualConnectOnWrongSSIDIsRefusedWithClearErrorAndChangesNothing() throws {

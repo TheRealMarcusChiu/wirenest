@@ -112,6 +112,58 @@ final class HelperLifecycleTests: XCTestCase {
         XCTAssertFalse(confExists("wn0"))
     }
 
+    func testInterfaceThatStillExistsIsNeverCleanupEvenWhenWgCannotReachIt() {
+        let a = UUID()
+        ok(.up(tunnelID: a, config: conf(1)))
+        commands.downLeavesInterfaceOnly = true
+        XCTAssertNotNil(engine.handle(.down(tunnelID: a)).error)
+        XCTAssertTrue(confExists("wn0"))
+        XCTAssertEqual(tunnels.map(\.tunnelID), [a], "still journaled")
+
+        let upsBefore = commands.quickCalls.filter { $0[1] == "up" }.count
+        XCTAssertNotNil(engine.handle(.up(tunnelID: UUID(), config: conf(2))).error)
+        XCTAssertEqual(commands.quickCalls.filter { $0[1] == "up" }.count, upsBefore, "no slot reuse, however long it has been")
+    }
+
+    func testFailingIfconfigIsNotEvidenceThatTheInterfaceIsGone() {
+        let a = UUID()
+        ok(.up(tunnelID: a, config: conf(1)))
+        commands.downLeavesInterfaceOnly = true
+        commands.ifconfigBroken = true
+        XCTAssertNotNil(engine.handle(.down(tunnelID: a)).error)
+        XCTAssertTrue(confExists("wn0"))
+    }
+
+    func testInterfaceGoneAndMonitorFinishedIsNormalCleanupAfterAnEarlierFailure() {
+        let a = UUID()
+        ok(.up(tunnelID: a, config: conf(1)))
+        commands.downLeavesInterfaceOnly = true
+        XCTAssertNotNil(engine.handle(.down(tunnelID: a)).error)
+
+        commands.slots.removeAll()
+        ok(.down(tunnelID: a))
+        XCTAssertTrue(tunnels.isEmpty)
+        XCTAssertFalse(confExists("wn0"))
+    }
+
+    func testASocketItCannotProveItOwnsIsNeverDeleted() throws {
+        let a = UUID()
+        ok(.up(tunnelID: a, config: conf(1)))
+        let real = try XCTUnwrap(commands.slots["wn0"]?.real)
+        commands.downLeavesInterfaceOnly = true
+        XCTAssertNotNil(engine.handle(.down(tunnelID: a)).error)
+
+        // By now the number may belong to another app: wg-quick's own socket is already gone, so this one is theirs.
+        let foreign = paths.wireguardRunDir.appendingPathComponent("\(real).sock")
+        try Data("other app".utf8).write(to: foreign)
+        XCTAssertNotNil(engine.handle(.down(tunnelID: a)).error)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: foreign.path), "not removed while failing")
+
+        commands.slots.removeAll()
+        ok(.down(tunnelID: a))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: foreign.path), "not removed on success either")
+    }
+
     func testRestartingOneTunnelNeverTouchesItsHealthySibling() {
         let a = UUID(), b = UUID()
         ok(.up(tunnelID: a, config: conf(1)))
@@ -126,6 +178,14 @@ final class HelperLifecycleTests: XCTestCase {
         XCTAssertFalse(commands.quickCalls[before...].contains { $0[2].hasSuffix("wn1.conf") })
         XCTAssertEqual(commands.slots["wn1"]!.real, slotOfB.real)
         XCTAssertTrue(tunnels.first { $0.tunnelID == b }!.alive)
+    }
+
+    func testRootBoundaryRefusesAHostnameEndpointBesideADefaultRoute() {
+        ok(.up(tunnelID: UUID(), config: confText(address: "10.1.0.2/32", allowedIPs: "0.0.0.0/0")))
+        let upsBefore = commands.quickCalls.count
+        let hostname = confText(address: "fd02::2/128", allowedIPs: "fd02::/64", endpoint: "vpn.example.com:51820")
+        XCTAssertNotNil(engine.handle(.up(tunnelID: UUID(), config: hostname)).error)
+        XCTAssertEqual(commands.quickCalls.count, upsBefore)
     }
 
     // MARK: start verification

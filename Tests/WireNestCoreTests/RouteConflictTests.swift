@@ -84,6 +84,41 @@ final class RouteConflictTests: XCTestCase {
         XCTAssertEqual(try kinds(v4, v6Only), [.endpointCaptured])
     }
 
+    func testHostnameEndpointBesideADefaultRouteFailsClosedAcrossFamiliesInBothOrders() throws {
+        // The name may resolve into the other tunnel's default route, whatever family that tunnel's own routes use.
+        let v4Default = confText(address: "10.1.0.2/32", allowedIPs: "0.0.0.0/0")
+        let v6Only = confText(address: "fd02::2/128", allowedIPs: "fd02::/64", endpoint: "vpn.example.com:51820")
+        XCTAssertEqual(try kinds(v4Default, v6Only), [.endpointCaptured])
+        XCTAssertEqual(try kinds(v6Only, v4Default), [.endpointCaptured])
+
+        let v6Default = confText(address: "fd01::2/128", allowedIPs: "::/0", endpoint: "[2001:db8::1]:51820")
+        let v4Only = confText(address: "10.2.0.2/32", allowedIPs: "10.2.0.0/24", endpoint: "vpn.example.com:51820")
+        XCTAssertEqual(try kinds(v6Default, v4Only), [.endpointCaptured])
+        XCTAssertEqual(try kinds(v4Only, v6Default), [.endpointCaptured])
+
+        let conflict = findRouteConflicts([try named("Full", v4Default), try named("Lab", v6Only)])[0]
+        XCTAssertTrue(conflict.message.contains("vpn.example.com"))
+        XCTAssertTrue(conflict.message.contains("Full"))
+    }
+
+    func testHostnameEndpointsOfADefaultRouteOwnerAreAlsoChecked() throws {
+        let v4Default = confText(address: "10.1.0.2/32", allowedIPs: "0.0.0.0/0", endpoint: "vpn.example.com:51820")
+        let v6Default = confText(address: "fd02::2/128", allowedIPs: "::/0", endpoint: "[2001:db8::2]:51820")
+        XCTAssertEqual(try kinds(v4Default, v6Default), [.endpointCaptured])
+    }
+
+    func testHostnameEndpointWithoutADefaultRouteAroundStaysAllowed() throws {
+        let a = confText(address: "10.1.0.2/32", allowedIPs: "10.1.0.0/24", endpoint: "a.example.com:51820")
+        let b = confText(address: "10.2.0.2/32", allowedIPs: "10.2.0.0/24", endpoint: "b.example.com:51820")
+        XCTAssertEqual(try kinds(a, b), [])
+    }
+
+    func testHostnameEndpointIsNotCapturedByATableOffDefaultRoute() throws {
+        let off = confText(address: "fd01::2/128", extraInterface: "Table = off", allowedIPs: "0.0.0.0/0", endpoint: "[2001:db8::1]:51820")
+        let name = confText(address: "10.2.0.2/32", allowedIPs: "10.2.0.0/24", endpoint: "vpn.example.com:51820")
+        XCTAssertEqual(try kinds(off, name), [])
+    }
+
     func testDisabledSiblingIsIgnoredAndConflictingImportIsSavedDisabled() throws {
         var state = AppState()
         let profile = state.addProfile(name: "p")

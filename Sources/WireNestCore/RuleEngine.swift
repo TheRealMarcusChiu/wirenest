@@ -68,6 +68,8 @@ public struct RuleEngine {
     private var publicIPBaseline: String?
     /// A real change waiting out debounce and dwell. Rules that win over it, or any guard, drop it.
     private var publicIPChangePending = false
+    /// Why a matching rule could not use its connection in the latest evaluation.
+    public private(set) var targetProblem: String?
 
     public init() {}
 
@@ -76,6 +78,7 @@ public struct RuleEngine {
     public mutating func evaluate(state: inout AppState, snapshot: NetworkSnapshot, now: Date) -> UUID? {
         let publicIPAllowed = state.publicIPAutomationEnabled
         let changedNow = observePublicIP(snapshot.publicIP, enabled: publicIPAllowed)
+        targetProblem = nil
 
         guard !state.manualOff else {
             pending = nil
@@ -92,14 +95,31 @@ public struct RuleEngine {
         }
 
         let changed = publicIPChangePending
+        var problem: String?
+        var changeRuleBlocked = false
         let winner = state.rules.first { rule in
-            guard rule.enabled, let target = state.profile(rule.profileID), target.ineligibilityReason(snapshot.ssid) == nil else { return false }
-            return rule.condition.matches(snapshot, publicIPAllowed: publicIPAllowed, publicIPChanged: changed)
+            guard rule.enabled, let target = state.profile(rule.profileID), target.ineligibilityReason(snapshot.ssid) == nil,
+                  rule.condition.matches(snapshot, publicIPAllowed: publicIPAllowed, publicIPChanged: changed) else { return false }
+            // Checked here rather than after selection, so a target that cannot connect costs no pin or dwell and lower rules still apply.
+            do {
+                _ = try AppState.resolveEnabledTunnels(target, requireAny: true)
+                return true
+            } catch {
+                problem = problem ?? "A rule could not use “\(target.name)”: \(error.localizedDescription)"
+                if rule.condition == .publicIPChanges { changeRuleBlocked = true }
+                return false
+            }
         }
+        targetProblem = problem
         let firesOnChange = winner?.condition == .publicIPChanges
-        if !firesOnChange { publicIPChangePending = false }
+        // A change whose only rule has a broken target stays pending, so repairing the target can still act on it.
+        if !firesOnChange, !(winner == nil && changeRuleBlocked) { publicIPChangePending = false }
 
-        guard let candidate = winner?.profileID, !(candidate == state.activeProfileID && state.connectionOn) else {
+        guard let candidate = winner?.profileID else {
+            pending = nil
+            return nil
+        }
+        guard !(candidate == state.activeProfileID && state.connectionOn) else {
             pending = nil
             publicIPChangePending = false
             return nil

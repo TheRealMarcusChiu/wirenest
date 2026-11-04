@@ -250,23 +250,20 @@ public final class HelperEngine {
     }
 
     /// wg-quick removes the socket and returns; wireguard-go and the utun go next, and only then does the
-    /// route monitor notice, delete its routes and exit. Its exit is therefore the proof of finished cleanup.
+    /// route monitor notice, delete its routes and exit. Only that exit and the utun being gone prove cleanup.
+    /// Anything less stays a failure, even if the utun might now be another app's: a utun number proves no owner.
     private func waitForCleanup(name: String, real: String?, polls: Int) -> Bool {
         let argv = quickArgv(name)
         for poll in 0...polls {
-            let halfway = poll >= polls / 2
             let groups = runner.liveProcessGroups(matching: argv)
-            // shortcut: past halfway a utun that wg cannot reach is assumed to be another app's reuse of the number, and a
-            // hung wireguard-go would pass as that; finding its real owner needs tracking the wireguard-go process itself.
-            let deviceGone = real.map { !isInterfaceAlive($0) && (halfway || !interfaceExists($0)) } ?? true
+            let deviceGone = real.map { !isInterfaceAlive($0) && isInterfaceAbsent($0) } ?? true
             if groups.isEmpty, deviceGone {
+                // Only our own slot's file. A socket is named by utun number, which another app may hold by now.
                 try? FileManager.default.removeItem(at: nameURL(name))
-                if let real { try? FileManager.default.removeItem(at: socketURL(real)) }
                 return true
             }
+            // A monitor's group also holds its wireguard-go, and the monitor's trap deletes its routes.
             if poll == polls / 2 {
-                // The same removal wg-quick does, which makes wireguard-go exit, and for a stuck monitor its trap's cleanup path.
-                if let real { try? FileManager.default.removeItem(at: socketURL(real)) }
                 for group in groups { runner.terminateProcessGroup(group) }
             }
             runner.pause(Self.pollInterval)
@@ -300,8 +297,9 @@ public final class HelperEngine {
         )
     }
 
-    private func interfaceExists(_ real: String) -> Bool {
-        runner.run("/sbin/ifconfig", [real], timeout: 5, readyMarker: nil).status == 0
+    /// ifconfig exits 1 for a missing interface. A timeout or failure to run says nothing, so it does not count.
+    private func isInterfaceAbsent(_ real: String) -> Bool {
+        runner.run("/sbin/ifconfig", [real], timeout: 5, readyMarker: nil).status == 1
     }
 
     private func isInterfaceAlive(_ real: String) -> Bool {

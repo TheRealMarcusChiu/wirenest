@@ -69,7 +69,7 @@ struct StatusBanners: View {
                 .font(.caption)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        ForEach([controller.connectionError, controller.dnsError, controller.notice].compactMap { $0 }, id: \.self) { message in
+        ForEach([controller.connectionError, controller.dnsError, controller.ruleProblem, controller.notice].compactMap { $0 }, id: \.self) { message in
             Text(message)
                 .font(.caption)
                 .foregroundColor(.red)
@@ -86,7 +86,7 @@ struct MenuContentView: View {
     }
 
     private var hasErrors: Bool {
-        controller.notice != nil || controller.connectionError != nil || controller.dnsError != nil
+        controller.notice != nil || controller.connectionError != nil || controller.dnsError != nil || controller.ruleProblem != nil
             || controller.views.values.contains { $0.lastError != nil }
     }
 

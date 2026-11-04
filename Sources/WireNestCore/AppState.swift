@@ -205,10 +205,10 @@ public struct AppState: Codable, Equatable {
     }
 
     private func validatedSSID(_ name: String) throws -> String {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Kept exactly: spaces are real SSID bytes, and "only not Home " must not start allowing "Home ".
         // Wi-Fi limits an SSID to 32 bytes, so a longer name could never match.
-        guard (1...32).contains(trimmed.utf8.count) else { throw StateError("Enter a Wi-Fi name of 1 to 32 bytes.") }
-        return trimmed
+        guard (1...32).contains(name.utf8.count) else { throw StateError("Enter a Wi-Fi name of 1 to 32 bytes.") }
+        return name
     }
 
     // MARK: Tunnels
@@ -321,7 +321,7 @@ public struct AppState: Codable, Equatable {
         return profile(id)?.ineligibilityReason(ssid)
     }
 
-    private static func resolveEnabledTunnels(_ profile: ConnectionProfile, requireAny: Bool) throws -> [DesiredTunnel] {
+    static func resolveEnabledTunnels(_ profile: ConnectionProfile, requireAny: Bool) throws -> [DesiredTunnel] {
         let enabled = profile.tunnels.filter(\.enabled)
         if requireAny, enabled.isEmpty {
             throw StateError("“\(profile.name)” has no enabled tunnels. Import or enable one first.")

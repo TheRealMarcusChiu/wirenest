@@ -71,7 +71,18 @@ private func conflictsBetween(_ a: NamedConfig, _ b: NamedConfig) -> [RouteConfl
 
     capture: for (owner, otherName, other) in [(a, b.name, coveredB), (b, a.name, coveredA)] {
         for peer in owner.config.peers {
-            guard let host = peer.endpoint?.host, let endpoint = CIDR(host) else { continue }
+            guard let host = peer.endpoint?.host else { continue }
+            guard let endpoint = CIDR(host) else {
+                // A name can resolve to either family at any time, so only a numeric endpoint can prove it escapes a default route.
+                if let route = other.first(where: \.isDefaultRoute) {
+                    result.append(RouteConflict(
+                        kind: .endpointCaptured,
+                        message: "The endpoint of “\(owner.name)” (\(host)) is a hostname that could be routed into “\(otherName)” by \(route). Use a numeric endpoint of the other IP family, or disable one tunnel."
+                    ))
+                    break capture
+                }
+                continue
+            }
             if let route = other.first(where: { $0.overlaps(endpoint) }) {
                 result.append(RouteConflict(
                     kind: .endpointCaptured,
