@@ -20,8 +20,8 @@ source "$(dirname "$0")/deps.sh"
 
 write_harness() {
   cat >"$1" <<'PY'
-import contextlib, errno, ipaddress, json, os, re, secrets, signal, socket, stat
-import subprocess, sys, tempfile, time, uuid
+import contextlib, errno, hashlib, ipaddress, json, os, re, secrets, signal, socket, stat
+import subprocess, sys, tempfile, time, types, uuid
 
 MARKER = b"HELPER_SMOKE_PASSED"
 TUNNELS = (("a", 71, 18081), ("b", 72, 18082))
@@ -173,6 +173,118 @@ def check_install(uid, cdhash):
     pin = json.loads(read(pin_path))
     if pin.get("ownerUID") != int(uid) or not cdhash or str(pin.get("appCDHash", "")).lower() != cdhash.lower():
         sys.exit("error: the installed client pin does not name this user and this exact app build")
+
+
+SOURCE_TOOL_GRANT = "write,append"
+SOURCE_DIR_GRANT = "add_file,add_subdirectory,delete_child"
+TOOL_NAMES = ("bash", "wg", "wg-quick", "wireguard-go")
+
+
+def run_native(cmd):
+    result = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15)
+    text = result.stdout.decode(errors="replace")
+    if result.returncode != 0:
+        sys.exit(f"error: {cmd[0]} exited {result.returncode}: {text.strip()}")
+    return text
+
+
+def acl_list_command(path):
+    return ["/bin/ls", "-led", path]
+
+
+def acl_grant_commands(user, tool, tools_dir):
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", user):
+        sys.exit("error: the user name cannot be used in an ACL entry")
+    return [
+        ["/bin/chmod", "+a", f"{user} allow {SOURCE_TOOL_GRANT}", tool],
+        ["/bin/chmod", "+a", f"{user} allow {SOURCE_DIR_GRANT}", tools_dir],
+    ]
+
+
+def parse_acl(listing):
+    # Every line must be understood: an unread line could be the grant this check exists to find.
+    lines = [line for line in listing.splitlines() if line.strip()]
+    if not lines or lines[0][0] not in "-d":
+        sys.exit("error: ls -led printed no file entry")
+    entries = []
+    for line in lines[1:]:
+        entry = re.fullmatch(r"\s*\d+:\s+(\S.*?)\s+(?:inherited\s+)?(allow|deny)\s+(\S+)\s*", line)
+        if not entry:
+            sys.exit(f"error: ls -led printed an unreadable ACL line: {line.strip()}")
+        entries.append((entry.group(1), entry.group(2), set(entry.group(3).split(","))))
+    return lines[0].split()[0], entries
+
+
+def require_grant(listing, user, permissions, path):
+    _, entries = parse_acl(listing)
+    wanted = set(permissions.split(","))
+    if not any(who == "user:" + user and kind == "allow" and wanted <= granted for who, kind, granted in entries):
+        sys.exit(f"error: {path} does not carry the ACL grant, so the installer check would prove nothing")
+
+
+def require_no_acl(listing, path):
+    # ls shows @ instead of + when a file has both, so the entries decide as well as the marker.
+    marker, entries = parse_acl(listing)
+    if marker.endswith("+") or entries:
+        sys.exit(f"error: installed {path} still has an extended ACL: {entries}")
+
+
+def grant_source_acl(tools_dir, user, native=run_native):
+    tool = os.path.join(tools_dir, "wg")
+    for path in (tool, tools_dir):
+        if os.lstat(path).st_uid != os.getuid():
+            sys.exit(f"error: {path} is not this user's copy; refusing to change its ACL")
+    for command in acl_grant_commands(user, tool, tools_dir):
+        native(command)
+    require_grant(native(acl_list_command(tool)), user, SOURCE_TOOL_GRANT, tool)
+    require_grant(native(acl_list_command(tools_dir)), user, SOURCE_DIR_GRANT, tools_dir)
+
+
+def require_root_protected(path, is_kind, lstat=os.lstat):
+    try:
+        info = lstat(path)
+    except OSError as error:
+        sys.exit(f"error: cannot inspect {path}: {errno.errorcode.get(error.errno, error.errno)}")
+    if not is_kind(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        sys.exit(f"error: {path} is not a root-owned entry closed to other writers")
+
+
+def require_write_denied(tool, tools_dir, opener=os.open):
+    # Opening writes nothing, so a failed check cannot damage the root-owned tool. Only a denial
+    # counts: ENOENT or EROFS would also stop a write without showing that permissions did.
+    probe = os.path.join(tools_dir, ".acl-probe-" + secrets.token_hex(8))
+    attempts = (
+        ("open for write", tool, (os.O_WRONLY,)),
+        ("open for append", tool, (os.O_WRONLY | os.O_APPEND,)),
+        ("create a file", probe, (os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)),
+    )
+    for label, path, arguments in attempts:
+        try:
+            descriptor = opener(path, *arguments)
+        except PermissionError:
+            continue
+        except OSError as error:
+            sys.exit(f"error: {label} on {path} failed with {errno.errorcode.get(error.errno, error.errno)}, not a permission denial")
+        os.close(descriptor)
+        if path == probe:
+            os.unlink(probe)
+        sys.exit(f"error: the installing user could {label} on {path} inside the root payload")
+
+
+def check_installed_acl(source_tools, install_dir=INSTALL_DIR, native=run_native, lstat=os.lstat, opener=os.open):
+    tools_dir = os.path.join(install_dir, "Tools")
+    tool = os.path.join(tools_dir, "wg")
+    require_root_protected(tools_dir, stat.S_ISDIR, lstat)
+    tool_paths = [os.path.join(tools_dir, name) for name in TOOL_NAMES]
+    for path in tool_paths:
+        require_root_protected(path, stat.S_ISREG, lstat)
+    # Reading it also proves the path is reachable, so a later denial is about the tool itself.
+    if hashlib.sha256(read(tool)).digest() != hashlib.sha256(read(os.path.join(source_tools, "wg"))).digest():
+        sys.exit("error: the installed wg differs from the signed app's wg")
+    payload = [install_dir, os.path.join(install_dir, "WireNestHelper"), os.path.join(install_dir, "client.json"), tools_dir] + tool_paths
+    for path in payload:
+        require_no_acl(native(acl_list_command(path)), path)
+    require_write_denied(tool, tools_dir, opener)
 
 
 def snapshot_dns(text):
@@ -350,6 +462,166 @@ def self_test_snapshot():
         assert rejected(**changes), label
 
 
+def self_test_acl():
+    # Canned listings and injected openers only: no ACL is created or read here.
+    def refused(function, *args, **kwargs):
+        try:
+            function(*args, **kwargs)
+        except SystemExit:
+            return True
+        return False
+
+    tool_grant = "-rwxr-xr-x+ 1 runner staff 9 Nov  3 19:41 wg\n 0: user:runner allow write,append\n"
+    dir_grant = "drwxr-xr-x+ 6 runner staff 9 Nov  3 19:41 Tools\n 0: user:runner allow add_file,add_subdirectory,delete_child\n"
+    clean_tool = "-rwxr-xr-x  1 root wheel 9 Nov  3 19:41 wg\n"
+    clean_dir = "drwxr-xr-x  6 root wheel 9 Nov  3 19:41 Tools\n"
+
+    assert acl_grant_commands("runner", "/t/wg", "/t") == [
+        ["/bin/chmod", "+a", "runner allow write,append", "/t/wg"],
+        ["/bin/chmod", "+a", "runner allow add_file,add_subdirectory,delete_child", "/t"],
+    ]
+    assert acl_list_command("/t/wg") == ["/bin/ls", "-led", "/t/wg"]
+    for user in ("", "two words", "-v", "x;y", "a\nb"):
+        assert refused(acl_grant_commands, user, "/t/wg", "/t"), user
+
+    assert not refused(require_grant, tool_grant, "runner", SOURCE_TOOL_GRANT, "p")
+    assert not refused(require_grant, dir_grant, "runner", SOURCE_DIR_GRANT, "p")
+    for label, listing in (
+        ("no ACL", clean_tool),
+        ("another user", tool_grant.replace("user:runner", "user:other")),
+        ("a group", tool_grant.replace("user:runner", "group:runner")),
+        ("deny", tool_grant.replace("allow", "deny")),
+        ("partial", tool_grant.replace("write,append", "write")),
+        ("unreadable line", tool_grant + " something else\n"),
+        ("empty", ""),
+        ("symlink", "lrwxr-xr-x  1 runner staff 9 Nov  3 19:41 wg -> x\n"),
+    ):
+        assert refused(require_grant, listing, "runner", SOURCE_TOOL_GRANT, "p"), label
+
+    assert not refused(require_no_acl, clean_tool, "p")
+    assert not refused(require_no_acl, clean_dir, "p")
+    assert not refused(require_no_acl, clean_tool.replace("x  1", "x@ 1"), "p")
+    for label, listing in (
+        ("copied grant", tool_grant),
+        ("directory grant", dir_grant),
+        ("marker alone", clean_tool.replace("x  1", "x+ 1")),
+        ("entry behind @", tool_grant.replace("x+ 1", "x@ 1")),
+        ("inherited entry", clean_tool + " 0: group:everyone inherited deny delete\n"),
+        ("unreadable line", clean_tool + " something else\n"),
+        ("empty", ""),
+    ):
+        assert refused(require_no_acl, listing, "p"), label
+
+    def denied(*_):
+        raise PermissionError(errno.EACCES, "denied")
+
+    def failing(code):
+        def opener(*_):
+            raise OSError(code, "failed")
+        return opener
+
+    def opened_after(denials):
+        # Denies the first attempts, then succeeds with a harmless real descriptor.
+        count = [0]
+
+        def opener(*_):
+            count[0] += 1
+            if count[0] <= denials:
+                denied()
+            return os.open(os.devnull, os.O_WRONLY)
+        return opener
+
+    assert not refused(require_write_denied, "/t/wg", "/t", denied)
+    assert not refused(require_write_denied, "/t/wg", "/t", failing(errno.EPERM))
+    for code in (errno.ENOENT, errno.EROFS, errno.EISDIR, errno.ETXTBSY):
+        assert refused(require_write_denied, "/t/wg", "/t", failing(code)), code
+    assert refused(require_write_denied, "/t/wg", "/t", opened_after(0))
+    assert refused(require_write_denied, "/t/wg", "/t", opened_after(1))
+
+    def attempts_seen(tool, tools_dir):
+        seen = []
+
+        def opener(path, *arguments):
+            seen.append((path, arguments[0]))
+            denied()
+        require_write_denied(tool, tools_dir, opener)
+        return seen
+
+    seen = attempts_seen("/t/wg", "/t")
+    assert seen[0] == ("/t/wg", os.O_WRONLY) and seen[1] == ("/t/wg", os.O_WRONLY | os.O_APPEND)
+    assert os.path.dirname(seen[2][0]) == "/t" and seen[2][1] & os.O_CREAT and seen[2][1] & os.O_EXCL
+    assert not any(flags & os.O_TRUNC for _, flags in seen)
+
+    regular = types.SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0)
+    assert not refused(require_root_protected, "p", stat.S_ISREG, lambda _: regular)
+    for label, info in (
+        ("user owned", types.SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=501)),
+        ("group writable", types.SimpleNamespace(st_mode=stat.S_IFREG | 0o775, st_uid=0)),
+        ("world writable", types.SimpleNamespace(st_mode=stat.S_IFREG | 0o757, st_uid=0)),
+        ("symlink", types.SimpleNamespace(st_mode=stat.S_IFLNK | 0o755, st_uid=0)),
+        ("wrong kind", types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)),
+    ):
+        assert refused(require_root_protected, "p", stat.S_ISREG, lambda _, value=info: value), label
+    assert refused(require_root_protected, "/nonexistent/acl-probe", stat.S_ISREG)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Real files this user owns: a real open succeeds, so it must fail without changing them.
+        file_path = os.path.join(tmp, "wg")
+        write_private(file_path, "payload")
+        assert refused(require_write_denied, file_path, tmp)
+        assert read(file_path) == b"payload" and os.listdir(tmp) == ["wg"]
+
+        def only_create_allowed(path, *arguments):
+            return os.open(path, *arguments) if path != file_path else denied()
+
+        assert refused(require_write_denied, file_path, tmp, only_create_allowed)
+        assert os.listdir(tmp) == ["wg"]
+
+        # grant_source_acl and check_installed_acl with native commands replaced.
+        source = os.path.join(tmp, "source")
+        os.mkdir(source)
+        write_private(os.path.join(source, "wg"), "payload")
+
+        def source_native(listing_tool, listing_dir, seen):
+            def native(cmd):
+                seen.append(cmd)
+                if cmd[0] == "/bin/chmod":
+                    return ""
+                return listing_dir if cmd[-1] == source else listing_tool
+            return native
+
+        seen = []
+        grant_source_acl(source, "runner", source_native(tool_grant, dir_grant, seen))
+        assert seen == acl_grant_commands("runner", os.path.join(source, "wg"), source) + [
+            acl_list_command(os.path.join(source, "wg")), acl_list_command(source)]
+        assert refused(grant_source_acl, source, "runner", source_native(clean_tool, dir_grant, []))
+        assert refused(grant_source_acl, source, "runner", source_native(tool_grant, clean_dir, []))
+
+        install = os.path.join(tmp, "install")
+        os.makedirs(os.path.join(install, "Tools"))
+        for name in TOOL_NAMES:
+            write_private(os.path.join(install, "Tools", name), "payload")
+
+        def root_lstat(path):
+            kind = stat.S_IFDIR if os.path.isdir(path) else stat.S_IFREG
+            return types.SimpleNamespace(st_mode=kind | 0o755, st_uid=0)
+
+        def clean_native(cmd):
+            return clean_dir if cmd[-1].endswith("Tools") or cmd[-1] == install else clean_tool
+
+        check = {"install_dir": install, "lstat": root_lstat}
+        check_installed_acl(source, native=clean_native, opener=denied, **check)
+        # Without these failures the fixture would pass on an installer that kept the grant.
+        assert refused(check_installed_acl, source, native=lambda cmd: tool_grant, opener=denied, **check)
+        assert refused(check_installed_acl, source, native=lambda cmd: dir_grant if cmd[-1].endswith("Tools") else clean_tool, opener=denied, **check)
+        assert refused(check_installed_acl, source, native=clean_native, opener=opened_after(0), **check)
+        assert refused(check_installed_acl, source, native=clean_native, opener=failing(errno.ENOENT), **check)
+        assert refused(check_installed_acl, source, native=clean_native, opener=denied, install_dir=install, lstat=lambda _: types.SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=501))
+        os.unlink(os.path.join(install, "Tools", "wg"))
+        write_private(os.path.join(install, "Tools", "wg"), "tampered")
+        assert refused(check_installed_acl, source, native=clean_native, opener=denied, **check)
+
+
 def self_test():
     def outcome(function, *args, **kwargs):
         try:
@@ -359,6 +631,7 @@ def self_test():
             return False
 
     self_test_snapshot()
+    self_test_acl()
     fake_wg = ["/bin/sh", "-c", 'case "$1" in pubkey) cat >/dev/null;; esac; head -c 32 /dev/urandom | base64', "wg"]
     with tempfile.TemporaryDirectory() as tmp:
         fixtures(tmp, fake_wg)
@@ -434,6 +707,10 @@ elif command == "drive":
     drive(args[0], [args[1]])
 elif command == "check-install":
     check_install(args[0], args[1])
+elif command == "grant-source-acl":
+    grant_source_acl(args[0], args[1])
+elif command == "check-installed-acl":
+    check_installed_acl(args[0])
 elif command == "snapshot":
     snapshot(args[0])
 elif command == "snapshot-fixtures":
@@ -627,7 +904,7 @@ if [[ $# -eq 1 && $1 == --self-test ]]; then
   write_harness "$tmp/harness.py"
   py self-test >/dev/null
   self_test_shell
-  echo "ok: helper smoke fixtures, verdict logic, snapshot parsing and peer stopping (no helper, routing or macOS involved)"
+  echo "ok: helper smoke fixtures, verdict logic, snapshot parsing, ACL check logic and peer stopping (no helper, real ACL, routing or macOS involved)"
   exit 0
 fi
 
@@ -645,7 +922,8 @@ app=$(cd "$1" && pwd -P)
 peer_bin=$2
 driver="$app/Contents/MacOS/WireNestApp"
 helper="$app/Contents/Library/LaunchServices/WireNestHelper"
-wg_tool="$app/Contents/Resources/Tools/wg"
+tools_dir="$app/Contents/Resources/Tools"
+wg_tool="$tools_dir/wg"
 launchd_label=com.marcuschiu.WireNest.helper
 # From HelperConstants and HelperPaths.production.
 helper_state=(
@@ -660,7 +938,8 @@ for file in "$driver" "$helper" "$wg_tool" /usr/bin/python3; do
 done
 python3 -I -c 'pass' || die "/usr/bin/python3 does not run"
 codesign --verify --strict --deep "$app" || die "$app failed signature verification"
-cdhash=$(codesign -dv --verbose=4 "$app" 2>&1 | awk -F= '$1 == "CDHash" {print $2}')
+app_cdhash() { codesign -dv --verbose=4 "$app" 2>&1 | awk -F= '$1 == "CDHash" {print $2}'; }
+cdhash=$(app_cdhash)
 [[ -n $cdhash ]] || die "could not read the app's code directory hash"
 sudo -n true || die "passwordless sudo is required"
 
@@ -756,12 +1035,22 @@ start_peer a 71 18081
 start_peer b 72 18082
 echo "ok: both userspace peers are listening"
 
+# Metadata on this runner's extracted copy, never the mounted DMG: the installer must not carry
+# a user's ACL grant into the root payload. Signatures do not seal ACLs, and no bytes change.
+py grant-source-acl "$tools_dir" "$(id -un)"
+codesign --verify --strict --deep "$app" || die "the ACL fixture broke the app signature"
+[[ $(app_cdhash) == "$cdhash" ]] || die "the ACL fixture changed the app's code directory hash"
+echo "ok: source Tools and wg grant this user write access through an ACL; signature unchanged"
+
 install_attempted=1
 # shortcut: sudo cannot be killed by this unprivileged script, so a hung helper is bounded by the
 # workflow step's timeout-minutes instead; add a root-side alarm if this ever runs outside that step.
 sudo -n "$helper" --install --uid "$(id -u)"
 py check-install "$(id -u)" "$cdhash"
 echo "ok: helper installed, root-owned, and pinned to this user and app build"
+# Runs as the ordinary user on purpose: sudo would pass every permission check.
+py check-installed-acl "$tools_dir"
+echo "ok: installed payload has no ACL, and this user was denied writing to wg or adding to Tools"
 
 py drive "$tmp" "$driver"
 echo "ok: driver finished with exit 0 and the exact final marker"
