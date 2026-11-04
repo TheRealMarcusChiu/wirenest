@@ -92,6 +92,17 @@ public enum EndpointRouteProof {
     }
 }
 
+extension EndpointRouteProof {
+    /// This exact network and prefix as an unscoped, installed route on this interface. A cached clone does not count.
+    public static func routeInstalled(netstat: String, address: String, prefix: Int, on interface: String) -> Bool {
+        guard let rows = parseRoutingTable(netstat), let value = ipv4Value(address), (0...32).contains(prefix) else { return false }
+        let wanted = IPv4Network(address: value, prefix: prefix)
+        return rows.contains {
+            $0.network == wanted && $0.interface == interface && $0.flags.contains("U") && $0.flags.isDisjoint(with: Set("IBRW"))
+        }
+    }
+}
+
 /// Addresses from `wg show … endpoints`, or nil if any is unknown or the output is not understood. A peer with no
 /// endpoint yet says "(none)", and that peer could still appear anywhere.
 public func parseWgEndpoints(_ output: String) -> [String]? {

@@ -274,6 +274,33 @@ final class EndpointRouteProofReplayTests: XCTestCase {
         XCTAssertFalse(EndpointRouteProof.defaultExpansionsInstalled(netstat: half, on: "utun5"))
     }
 
+    func testInstalledRouteMustMatchNetworkPrefixAndInterfaceExactly() {
+        // Synthetic rows, in the abbreviated forms of the observed table.
+        let table = ObservedARM64.netstat + """
+        198.18.72          utun5              USc                 utun5
+        10.2/16            utun5              USc                 utun5
+        198.18.73.2        utun5              UH                  utun5
+        198.18.74          utun5              USIc                utun5
+        198.18.75          utun5              UBSc                utun5
+        198.18.76.9        link#9             UHWIi               utun5
+        """
+        func installed(_ address: String, _ prefix: Int, on interface: String = "utun5") -> Bool {
+            EndpointRouteProof.routeInstalled(netstat: table, address: address, prefix: prefix, on: interface)
+        }
+        XCTAssertTrue(installed("198.18.72.0", 24))
+        XCTAssertTrue(installed("198.18.72.9", 24), "AllowedIPs may carry host bits")
+        XCTAssertTrue(installed("10.2.0.0", 16))
+        XCTAssertTrue(installed("198.18.73.2", 32))
+        XCTAssertFalse(installed("198.18.72.0", 24, on: "utun6"))
+        XCTAssertFalse(installed("198.18.72.0", 25), "longer than installed")
+        XCTAssertFalse(installed("198.18.72.0", 16), "shorter than installed")
+        XCTAssertFalse(installed("198.18.72.5", 32), "inside the route, but not that route")
+        XCTAssertFalse(installed("198.18.74.0", 24), "scoped")
+        XCTAssertFalse(installed("198.18.75.0", 24), "blackhole")
+        XCTAssertFalse(installed("198.18.76.9", 32), "a cached clone is not an installed route")
+        XCTAssertFalse(EndpointRouteProof.routeInstalled(netstat: "no table", address: "198.18.72.0", prefix: 24, on: "utun5"))
+    }
+
     func testWgEndpointParsing() {
         XCTAssertEqual(parseWgEndpoints("\(testKey(2))\t192.168.86.51:51820\n\(testKey(3))\t[2001:db8::1]:51820\n"), ["192.168.86.51", "2001:db8::1"])
         XCTAssertNil(parseWgEndpoints("\(testKey(2))\t(none)\n"), "unknown is not safe")
@@ -719,6 +746,103 @@ final class FullLANRootTests: XCTestCase {
         XCTAssertNil(status.routeFailure)
         ok(.up(tunnelID: air, config: airVPN))
         XCTAssertTrue(running(air))
+    }
+
+    // MARK: unreadable is not stopped
+
+    func testStatsTimeoutNeverWaivesTheProofOfALiveSplitTunnel() {
+        for failing in ["latest-handshakes", "transfer"] {
+            commands.installSyntheticLAN()
+            commands.wgShowTimeouts = []
+            ok(.up(tunnelID: local, config: localSome))
+            ok(.up(tunnelID: air, config: airVPN))
+
+            commands.wgShowTimeouts = [failing]
+            loseLANProof()
+            let after = status
+            XCTAssertNil(commands.slots["wn1"], "\(failing): the default route must go, even though stats could not be read")
+            XCTAssertNotNil(commands.slots["wn0"], "\(failing): the split tunnel is preserved")
+            XCTAssertTrue(after.tunnels.contains { $0.tunnelID == local }, failing)
+            XCTAssertFalse(after.tunnels.contains { $0.tunnelID == air }, failing)
+            XCTAssertTrue(after.routeFailure?.contains("192.168.86.51") == true, failing)
+
+            commands.wgShowTimeouts = []
+            commands.installSyntheticLAN()
+            ok(.downAll)
+        }
+    }
+
+    func testStatsTimeoutDoesNotLetTheDefaultOwnerPastPreflight() {
+        ok(.up(tunnelID: local, config: localSome))
+        commands.wgShowTimeouts = ["latest-handshakes"]
+        loseLANProof()
+        let before = upCount
+        XCTAssertNotNil(engine.handle(.up(tunnelID: air, config: airVPN)).error)
+        XCTAssertEqual(upCount, before, "no spawn")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.runtimeDir.appendingPathComponent("wn1.conf").path), "no config written")
+    }
+
+    func testUnreadableEndpointsFailClosedOnALiveTunnel() {
+        ok(.up(tunnelID: local, config: localSome))
+        ok(.up(tunnelID: air, config: airVPN))
+        commands.wgShowTimeouts = ["endpoints"]
+        XCTAssertNotNil(status.routeFailure, "the LAN route is fine, but which endpoint is in use is not known")
+        XCTAssertNil(commands.slots["wn1"])
+        XCTAssertNotNil(commands.slots["wn0"])
+    }
+
+    func testOnlyAnAbsentInterfaceExemptsATunnelFromProof() {
+        ok(.up(tunnelID: local, config: localSome))
+        ok(.up(tunnelID: air, config: airVPN))
+        loseLANProof()
+        commands.slots["wn0"] = nil
+        XCTAssertNil(status.routeFailure, "ifconfig says it is gone, so it has nothing to send")
+        XCTAssertNotNil(commands.slots["wn1"])
+    }
+
+    func testAnUnknownInterfaceStateIsNotAbsence() {
+        ok(.up(tunnelID: local, config: localSome))
+        ok(.up(tunnelID: air, config: airVPN))
+        commands.wgShowTimeouts = ["endpoints"]
+        commands.ifconfigBroken = true
+        XCTAssertNotNil(status.routeFailure)
+        XCTAssertNil(commands.slots["wn1"])
+    }
+
+    func testRetiringStillRunsTheRealTeardownWhenStatsAreUnreadable() {
+        ok(.up(tunnelID: air, config: airVPN))
+        commands.wgShowTimeouts = ["latest-handshakes"]
+        ok(.down(tunnelID: air))
+        XCTAssertTrue(commands.quickCalls.contains { $0[1] == "down" })
+        XCTAssertNil(commands.slots["wn0"])
+    }
+
+    // MARK: the installed route, not one lucky address
+
+    /// The split tunnel's address is outside its AllowedIPs, so no connected route could stand in for the missing one.
+    private let splitOutsideAddress = confText(address: "10.9.0.2/32", allowedIPs: "192.168.111.0/24", endpoint: "192.168.86.51:51820")
+
+    func testAMissingNarrowRouteIsNotRunningEvenIfItsBaseAddressLooksRight() {
+        for destination in ["", "192.168.111.0/32", "192.168.111/25", "192.168/16"] {
+            commands.narrowRowDestination = [:]
+            ok(.up(tunnelID: air, config: airVPN))
+            let slotOfAir = commands.slots["wn0"]!
+            commands.narrowRowDestination = ["192.168.111.0/24": destination]
+
+            XCTAssertNotNil(engine.handle(.up(tunnelID: local, config: splitOutsideAddress)).error, destination)
+            XCTAssertFalse(status.tunnels.contains { $0.tunnelID == local }, destination)
+            XCTAssertNil(commands.slots["wn1"], "\(destination): only the new tunnel is retired")
+            XCTAssertEqual(commands.slots["wn0"]?.real, slotOfAir.real, destination)
+            XCTAssertTrue(running(air), destination)
+            ok(.downAll)
+        }
+    }
+
+    func testTheExactInstalledRouteIsAccepted() {
+        ok(.up(tunnelID: air, config: airVPN))
+        commands.narrowRowDestination = ["192.168.111.0/24": "192.168.111"]
+        ok(.up(tunnelID: local, config: splitOutsideAddress))
+        XCTAssertTrue(running(local))
     }
 
     func testTunnelsWithNoDefaultRouteNeverRunRouteCommands() {

@@ -232,14 +232,18 @@ public final class HelperEngine {
     /// A tunnel running beside a default-route tunnel is safe only while its endpoints are proven to stay outside it.
     private func endpointProofFailure(_ exposure: EndpointExposure) -> String? {
         let endpoints: [String]
-        if let real = realInterface(exposure.tunnel) {
-            // A dead tunnel sends nothing to capture. Its own restart is checked again on the way up.
-            guard isInterfaceAlive(real) else { return nil }
+        if let entry = session.tunnels.values.first(where: { $0.name == exposure.tunnel }) {
+            let unknown = unsafeRouteMessage("a tunnel's endpoint", reason: "its current endpoint is unknown")
+            guard let real = realInterface(entry.name) ?? entry.interface else { return unknown }
             let result = runner.run(paths.wg, ["show", real, "endpoints"], timeout: 5, readyMarker: nil)
-            guard result.status == 0, let actual = parseWgEndpoints(result.output) else {
-                return unsafeRouteMessage("a tunnel's endpoint", reason: "its current endpoint is unknown")
+            if result.status == 0, let actual = parseWgEndpoints(result.output) {
+                endpoints = actual
+            } else if isInterfaceAbsent(real) {
+                // Only a device that is really gone has nothing to send. Failing to read it proves nothing, and its restart is checked on the way up.
+                return nil
+            } else {
+                return unknown
             }
-            endpoints = actual
         } else {
             endpoints = exposure.configuredEndpoints
         }
@@ -289,8 +293,13 @@ public final class HelperEngine {
                     return "The default-route tunnel's routes did not appear on \(real). It was stopped."
                 }
             }
-            for route in routes where !route.isDefaultRoute {
-                guard EndpointRouteProof.lookupInterface(route.address, runner: runner) == real else {
+            let narrow = routes.filter { !$0.isDefaultRoute }
+            guard !narrow.isEmpty else { continue }
+            // A lookup alone is one address: a /32 or a wider route on this interface would answer it the same way.
+            let table = EndpointRouteProof.readRoutingTable(runner)
+            for route in narrow {
+                guard table.status == 0, EndpointRouteProof.routeInstalled(netstat: table.output, address: route.address, prefix: route.prefix, on: real),
+                      EndpointRouteProof.lookupInterface(route.address, runner: runner) == real else {
                     return "The route \(route) is not in effect on \(real). The tunnel was stopped."
                 }
             }
@@ -341,7 +350,8 @@ public final class HelperEngine {
             throw error
         }
 
-        if let named = realInterface(entry.name), isInterfaceAlive(named) {
+        // Only an interface known to be gone skips this: unreadable stats must not leave its routes installed.
+        if let named = realInterface(entry.name), !isInterfaceAbsent(named) {
             let result = runner.run(paths.bash, [paths.wgQuick, "down", confURL(entry.name).path], timeout: 30, readyMarker: nil)
             if result.status != 0, isInterfaceAlive(named) {
                 // wg-quick stops before touching anything when it fails like this, so a running tunnel simply stays running.

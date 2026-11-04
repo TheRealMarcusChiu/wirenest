@@ -22,6 +22,10 @@ final class FakeCommands: CommandRunning {
     var hardwarePorts = ""
     var actualEndpoints: [String: String] = [:]
     var defaultRowsAppearAfterPauses = 0
+    /// `wg show IF <what>` subcommands that time out while the device itself is fine.
+    var wgShowTimeouts: Set<String> = []
+    /// Replaces a narrow route's netstat destination. An empty string leaves that route out of the table.
+    var narrowRowDestination: [String: String] = [:]
 
     func installSyntheticLAN() {
         netstatBase = """
@@ -145,6 +149,7 @@ final class FakeCommands: CommandRunning {
             guard slots.values.contains(where: { $0.real == args[1] && $0.wgReachable }) else {
                 return CommandResult(status: 1, output: "Unable to access interface")
             }
+            if let what = args.last, wgShowTimeouts.contains(what) { return CommandResult(status: 124, output: "Timed out") }
             switch args.last {
             case "latest-handshakes": return CommandResult(status: 0, output: "\(testKey(2))\t1700000000\n")
             case "transfer": return CommandResult(status: 0, output: "\(testKey(2))\t11\t22\n")
@@ -169,7 +174,14 @@ final class FakeCommands: CommandRunning {
                 pauses >= slot.defaultRowsAtPause && slot.config?.table != .off
                     && slot.config?.peers.flatMap(\.allowedIPs).contains { $0.isDefaultRoute && !$0.isIPv6 } == true
             }.map { "0/1                \($0.real)              USc                 \($0.real)\n128.0/1            \($0.real)              USc                 \($0.real)\n" }
-            return CommandResult(status: 0, output: netstatBase + rows.joined())
+            let narrow = slots.values.flatMap { slot -> [String] in
+                guard slot.config?.table != .off else { return [] }
+                return (slot.config?.peers.flatMap(\.allowedIPs) ?? []).filter { !$0.isDefaultRoute && !$0.isIPv6 }.compactMap { route in
+                    let destination = narrowRowDestination[route.description] ?? route.description
+                    return destination.isEmpty ? nil : "\(destination)     \(slot.real)     USc     \(slot.real)\n"
+                }
+            }
+            return CommandResult(status: 0, output: netstatBase + rows.joined() + narrow.joined())
         }
         if executable == "/usr/sbin/networksetup", args == ["-listallhardwareports"] {
             return CommandResult(status: 0, output: hardwarePorts)

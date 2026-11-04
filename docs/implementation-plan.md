@@ -167,11 +167,12 @@ and `networksetup -listallhardwareports`, through fixed paths with timeouts, and
 Anything unknown, malformed or ambiguous is a refusal.
 
 **When it is checked.** Before a start and before any root action, then again after `wg-quick` returns and
-before `running`, when the kernel must also show the `/1` rows on the new interface and each narrower route
-in effect, polled for up to 5 seconds. On a failure only the new tunnel is retired, through the normal
-cleanup. The check also runs on every status poll, on same-config `up` and on helper start, using the
-actual endpoints from `wg show … endpoints`, so a roamed endpoint is what gets proved. An unknown endpoint is
-a refusal. If the proof is lost, the full tunnel is retired while the narrower tunnel and DNS continue, the
+before `running`, when the kernel's table must also show the `/1` rows on the new interface and each narrower
+route with its exact prefix, with a lookup agreeing, polled for up to 5 seconds. On a failure only the new
+tunnel is retired, through the normal cleanup. The check also runs on every status poll, on same-config `up`
+and on helper start, using the actual endpoints from `wg show … endpoints`, so a roamed endpoint is what gets
+proved. An unknown endpoint is a refusal. A failed read never counts as a stopped tunnel: only `ifconfig`
+reporting that its interface does not exist exempts it. If the proof is lost, the full tunnel is retired while the narrower tunnel and DNS continue, the
 reason is reported in `routeFailure`, and a cleanup that cannot finish stays journaled and is retried. The
 app then retries the full tunnel with its usual backoff, and each attempt is refused until the proof holds.
 
