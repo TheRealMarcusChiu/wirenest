@@ -301,6 +301,32 @@ final class EndpointRouteProofReplayTests: XCTestCase {
         XCTAssertFalse(EndpointRouteProof.routeInstalled(netstat: "no table", address: "198.18.72.0", prefix: 24, on: "utun5"))
     }
 
+    func testInterfacePresenceComesOnlyFromACompleteListing() {
+        func presence(_ name: String, _ result: CommandResult) -> InterfacePresence {
+            EndpointRouteProof.interfacePresence(name, ifconfigAll: result)
+        }
+        let observed = ok(ObservedARM64.ifconfig)
+        XCTAssertEqual(presence("en0", observed), .present)
+        XCTAssertEqual(presence("utun0", observed), .present)
+        XCTAssertEqual(presence("utun9", observed), .absent, "a good listing without it")
+
+        // Synthetic mutations of the observed listing.
+        XCTAssertEqual(presence("utun9", CommandResult(status: 1, output: ObservedARM64.ifconfig)), .unknown, "failed")
+        XCTAssertEqual(presence("utun9", CommandResult(status: 124, output: ObservedARM64.ifconfig)), .unknown, "timed out")
+        XCTAssertEqual(presence("utun9", ok("")), .unknown, "empty")
+        XCTAssertEqual(presence("utun9", ok("not a listing\n")), .unknown, "malformed")
+        XCTAssertEqual(presence("utun9", ok(ObservedARM64.ifconfig + "ifconfig: some warning\n")), .unknown, "stray text")
+        XCTAssertEqual(presence("utun9", ok(ObservedARM64.ifconfig + "en0: flags=8863<UP> mtu 1500\n")), .unknown, "ambiguous")
+
+        let withoutLoopback = String(ObservedARM64.ifconfig[ObservedARM64.ifconfig.range(of: "gif0:")!.lowerBound...])
+        XCTAssertEqual(presence("utun9", ok(withoutLoopback)), .unknown, "cut at a line boundary: the head is what truncation loses")
+        let cutMidBlock = String(ObservedARM64.ifconfig[ObservedARM64.ifconfig.range(of: "\toptions=400")!.lowerBound...])
+        XCTAssertEqual(presence("utun9", ok(cutMidBlock)), .unknown, "cut inside a block")
+
+        let padded = ObservedARM64.ifconfig + String(repeating: "\tnd6 options=201<PERFORMNUD,DAD>\n", count: HelperConstants.maxCommandOutputBytes / 32)
+        XCTAssertEqual(presence("utun9", ok(padded)), .unknown, "as long as the captured limit, so possibly cut")
+    }
+
     func testWgEndpointParsing() {
         XCTAssertEqual(parseWgEndpoints("\(testKey(2))\t192.168.86.51:51820\n\(testKey(3))\t[2001:db8::1]:51820\n"), ["192.168.86.51", "2001:db8::1"])
         XCTAssertNil(parseWgEndpoints("\(testKey(2))\t(none)\n"), "unknown is not safe")
@@ -815,6 +841,139 @@ final class FullLANRootTests: XCTestCase {
         ok(.down(tunnelID: air))
         XCTAssertTrue(commands.quickCalls.contains { $0[1] == "down" })
         XCTAssertNil(commands.slots["wn0"])
+    }
+
+    // MARK: unknown is not absent
+
+    /// The device and its monitor are really there, its endpoints cannot be read, and `ifconfig IF` exits 1 as it does for any error.
+    private func makeSplitUnreadable() {
+        commands.wgShowTimeouts = ["endpoints"]
+        commands.ifconfigNamedFailsGenerically = true
+    }
+
+    func testGenericIfconfigFailureDoesNotLetTheDefaultOwnerPastPreflight() {
+        ok(.up(tunnelID: local, config: localSome))
+        let slot = commands.slots["wn0"]!
+        makeSplitUnreadable()
+        let before = upCount
+
+        XCTAssertNotNil(engine.handle(.up(tunnelID: air, config: airVPN)).error)
+        XCTAssertEqual(upCount, before, "no spawn")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.runtimeDir.appendingPathComponent("wn1.conf").path), "no config written")
+        XCTAssertEqual(commands.slots["wn0"]?.real, slot.real)
+        XCTAssertEqual(commands.slots["wn0"]?.monitorAlive, true, "the sibling is untouched")
+        XCTAssertTrue(commands.terminatedGroups.isEmpty)
+    }
+
+    func testGenericIfconfigFailureAtRuntimeStopsTheDefaultOwnerAndKeepsTheSplit() {
+        for proofLost in [false, true] {
+            commands.wgShowTimeouts = []
+            commands.ifconfigNamedFailsGenerically = false
+            commands.installSyntheticLAN()
+            ok(.up(tunnelID: local, config: localSome))
+            ok(.up(tunnelID: air, config: airVPN))
+
+            makeSplitUnreadable()
+            if proofLost { loseLANProof() }
+            let after = status
+            XCTAssertNil(commands.slots["wn1"], "proofLost \(proofLost): the capturing routes must go")
+            XCTAssertEqual(commands.slots["wn0"]?.monitorAlive, true, "proofLost \(proofLost)")
+            XCTAssertTrue(after.tunnels.contains { $0.tunnelID == local }, "proofLost \(proofLost)")
+            XCTAssertFalse(after.tunnels.contains { $0.tunnelID == air }, "proofLost \(proofLost)")
+            XCTAssertTrue(after.routeFailure?.contains("unknown") == true, "proofLost \(proofLost): the uncertainty is reported")
+
+            commands.wgShowTimeouts = []
+            commands.ifconfigNamedFailsGenerically = false
+            ok(.downAll)
+        }
+    }
+
+    private func nameFile(_ name: String) -> String {
+        paths.wireguardRunDir.appendingPathComponent("\(name).name").path
+    }
+
+    private func confFile(_ name: String) -> String {
+        paths.runtimeDir.appendingPathComponent("\(name).conf").path
+    }
+
+    func testPresentInterfaceWithNoMonitorAndUnreadableStatsKeepsEveryOwnershipRecord() throws {
+        ok(.up(tunnelID: local, config: localSome))
+        let real = try XCTUnwrap(commands.slots["wn0"]?.real)
+        commands.slots["wn0"]?.monitorAlive = false
+        commands.wgShowTimeouts = ["latest-handshakes", "transfer"]
+        commands.ifconfigNamedFailsGenerically = true
+        commands.failDown = true
+        let socket = paths.wireguardRunDir.appendingPathComponent("\(real).sock").path
+
+        XCTAssertNotNil(engine.handle(.down(tunnelID: local)).error, "no false cleanup success")
+        XCTAssertTrue(commands.quickCalls.contains { $0[1] == "down" }, "uncertainty must still attempt the real teardown")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: confFile("wn0")), "config")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: nameFile("wn0")), "name")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: socket), "no socket is ever unlinked by the helper")
+        XCTAssertTrue(status.tunnels.contains { $0.tunnelID == local }, "journal")
+
+        let restarted = try HelperEngine(paths: paths, runner: commands)
+        restarted.recoverOnStart()
+        XCTAssertEqual(restarted.handle(.status).status?.tunnels.map(\.tunnelID), [local], "the journal survives a restart")
+    }
+
+    func testGenericIfconfigFailureAfterADownThatLeavesTheInterfaceIsNotCleanup() {
+        ok(.up(tunnelID: local, config: localSome))
+        commands.downLeavesInterfaceOnly = true
+        commands.ifconfigNamedFailsGenerically = true
+        XCTAssertNotNil(engine.handle(.down(tunnelID: local)).error)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: confFile("wn0")))
+
+        let upsBefore = upCount
+        XCTAssertNotNil(engine.handle(.up(tunnelID: air, config: airVPN)).error, "new tunnels stay blocked")
+        XCTAssertEqual(upCount, upsBefore)
+    }
+
+    func testAGoodListingWithoutTheInterfaceIsRealAbsenceEvenWhileIfconfigIFErrors() {
+        ok(.up(tunnelID: local, config: localSome))
+        commands.downLeavesInterfaceOnly = true
+        commands.ifconfigNamedFailsGenerically = true
+        XCTAssertNotNil(engine.handle(.down(tunnelID: local)).error)
+
+        commands.slots.removeAll()
+        ok(.down(tunnelID: local))
+        XCTAssertTrue(status.tunnels.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: confFile("wn0")))
+    }
+
+    func testAGoodListingWithoutTheSplitTunnelExemptsIt() {
+        ok(.up(tunnelID: local, config: localSome))
+        ok(.up(tunnelID: air, config: airVPN))
+        makeSplitUnreadable()
+        commands.slots["wn0"] = nil
+        XCTAssertNil(status.routeFailure)
+        XCTAssertNotNil(commands.slots["wn1"])
+    }
+
+    func testAnUnusableListingIsNeverAbsence() {
+        let unusable: [(String, CommandResult)] = [
+            ("failed", CommandResult(status: 1, output: "ifconfig: socket: Operation not permitted")),
+            ("empty", CommandResult(status: 0, output: "")),
+            ("malformed", CommandResult(status: 0, output: "not a listing\n")),
+            ("no loopback, so possibly cut", CommandResult(status: 0, output: "en0: flags=8863<UP,RUNNING> mtu 1500\n")),
+            ("timed out", CommandResult(status: 124, output: "")),
+        ]
+        for (reason, listing) in unusable {
+            commands.ifconfigEnumeration = nil
+            commands.downLeavesInterfaceOnly = false
+            ok(.up(tunnelID: local, config: localSome))
+            commands.downLeavesInterfaceOnly = true
+            XCTAssertNotNil(engine.handle(.down(tunnelID: local)).error, reason)
+
+            // The fake's device is gone now, but nothing here can know that.
+            commands.slots.removeAll()
+            commands.ifconfigEnumeration = listing
+            XCTAssertNotNil(engine.handle(.down(tunnelID: local)).error, reason)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: confFile("wn0")), reason)
+
+            commands.ifconfigEnumeration = nil
+            ok(.down(tunnelID: local))
+        }
     }
 
     // MARK: the installed route, not one lucky address

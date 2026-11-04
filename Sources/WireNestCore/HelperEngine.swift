@@ -420,9 +420,9 @@ public final class HelperEngine {
         )
     }
 
-    /// ifconfig exits 1 for a missing interface. A timeout or failure to run says nothing, so it does not count.
+    /// True only on affirmative evidence. Present and unknown are treated alike by every caller: the interface may still hold routes.
     private func isInterfaceAbsent(_ real: String) -> Bool {
-        runner.run("/sbin/ifconfig", [real], timeout: 5, readyMarker: nil).status == 1
+        EndpointRouteProof.interfacePresence(real, ifconfigAll: runner.run("/sbin/ifconfig", ["-a"], timeout: 5, readyMarker: nil)) == .absent
     }
 
     private func isInterfaceAlive(_ real: String) -> Bool {

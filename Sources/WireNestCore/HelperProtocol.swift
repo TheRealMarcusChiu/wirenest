@@ -13,6 +13,8 @@ public enum HelperConstants {
     public static let launchdPlistPath = "/Library/LaunchDaemons/com.marcuschiu.WireNest.helper.plist"
     public static let toolNames = ["bash", "wg", "wg-quick", "wireguard-go"]
     public static let maxRequestBytes = 256 * 1024
+    /// `ProcessRunner` keeps only the end of a command's output beyond this.
+    public static let maxCommandOutputBytes = 64 * 1024
     public static let maxTunnels = 16
     public static let slotNames = (0..<maxTunnels).map { "wn\($0)" }
 }

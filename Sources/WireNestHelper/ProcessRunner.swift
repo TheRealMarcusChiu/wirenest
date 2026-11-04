@@ -149,6 +149,6 @@ final class ProcessRunner: CommandRunning {
 
     private func readOutput(_ url: URL) -> String {
         guard let data = try? Data(contentsOf: url) else { return "" }
-        return String(decoding: data.suffix(64 * 1024), as: UTF8.self)
+        return String(decoding: data.suffix(HelperConstants.maxCommandOutputBytes), as: UTF8.self)
     }
 }

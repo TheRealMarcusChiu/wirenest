@@ -18,7 +18,12 @@ final class FakeCommands: CommandRunning {
     /// Synthetic: shaped like B4's observed Darwin output, but this LAN and these rows were never observed.
     var routeGet: [String: CommandResult] = [:]
     var netstatBase = "Routing tables\n\nInternet:\nDestination        Gateway            Flags               Netif Expire\n"
-    var ifconfigAll = ""
+    /// What `ifconfig -a` lists besides live slots, which it always lists.
+    var ifconfigAll = "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\tinet 127.0.0.1 netmask 0xff000000\n"
+    /// Replaces the whole `ifconfig -a` result, for a failed or unusable enumeration.
+    var ifconfigEnumeration: CommandResult?
+    /// `ifconfig IF` exits 1 for a permission, socket or read error too, with the interface still there.
+    var ifconfigNamedFailsGenerically = false
     var hardwarePorts = ""
     var actualEndpoints: [String: String] = [:]
     var defaultRowsAppearAfterPauses = 0
@@ -186,11 +191,14 @@ final class FakeCommands: CommandRunning {
         if executable == "/usr/sbin/networksetup", args == ["-listallhardwareports"] {
             return CommandResult(status: 0, output: hardwarePorts)
         }
+        if executable == "/sbin/ifconfig", ifconfigBroken { return CommandResult(status: 124, output: "Timed out") }
         if executable == "/sbin/ifconfig", args == ["-a"] {
-            return CommandResult(status: 0, output: ifconfigAll)
+            if let ifconfigEnumeration { return ifconfigEnumeration }
+            let live = slots.values.map { "\($0.real): flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1420\n" }
+            return CommandResult(status: 0, output: ifconfigAll + live.joined())
         }
         if executable == "/sbin/ifconfig" {
-            if ifconfigBroken { return CommandResult(status: 124, output: "Timed out") }
+            if ifconfigNamedFailsGenerically { return CommandResult(status: 1, output: "ifconfig: ioctl (SIOCGIFFLAGS): Operation not permitted") }
             return CommandResult(status: slots.values.contains { $0.real == args[0] } ? 0 : 1, output: "")
         }
         if executable == "/usr/sbin/networksetup" {

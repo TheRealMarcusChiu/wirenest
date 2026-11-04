@@ -171,8 +171,8 @@ before `running`, when the kernel's table must also show the `/1` rows on the ne
 route with its exact prefix, with a lookup agreeing, polled for up to 5 seconds. On a failure only the new
 tunnel is retired, through the normal cleanup. The check also runs on every status poll, on same-config `up`
 and on helper start, using the actual endpoints from `wg show … endpoints`, so a roamed endpoint is what gets
-proved. An unknown endpoint is a refusal. A failed read never counts as a stopped tunnel: only `ifconfig`
-reporting that its interface does not exist exempts it. If the proof is lost, the full tunnel is retired while the narrower tunnel and DNS continue, the
+proved. An unknown endpoint is a refusal. A failed read never counts as a stopped tunnel: only a complete
+`ifconfig -a` listing without its interface exempts it. If the proof is lost, the full tunnel is retired while the narrower tunnel and DNS continue, the
 reason is reported in `routeFailure`, and a cleanup that cannot finish stays journaled and is retried. The
 app then retries the full tunnel with its usual backoff, and each attempt is refused until the proof holds.
 
@@ -231,7 +231,9 @@ peers, and the monitor is running. Anything else rolls back.
 
 **Stop.** `wg-quick down` only removes the socket. wireguard-go and the utun then go, and only then does
 the route monitor notice, delete its routes and exit. The monitor's exit is therefore the proof of
-finished cleanup, together with the utun being gone by `ifconfig`'s own "no such interface" answer. The
+finished cleanup, together with the utun missing from a complete `ifconfig -a` listing. A failed, empty,
+malformed or possibly cut listing is unknown, not absent, and `ifconfig IF` is not used because it exits 1 for
+any error. The
 slot and its config stay reserved until then, with a 20 second limit. Past half of that, the helper sends
 SIGTERM to the monitor's process group, which holds its wireguard-go and runs its cleanup trap. The helper
 never deletes a socket, as sockets are named by utun number and that number may have another owner by then.

@@ -92,7 +92,21 @@ public enum EndpointRouteProof {
     }
 }
 
+public enum InterfacePresence: Equatable {
+    case present, absent, unknown
+}
+
 extension EndpointRouteProof {
+    /// Only a complete `ifconfig -a` listing can show that something is missing. `ifconfig IF` exits 1 for permission, socket
+    /// and read errors too. Capture keeps the end of long output, and lo0 comes first, so its absence or a full capture means a cut.
+    public static func interfacePresence(_ name: String, ifconfigAll result: CommandResult) -> InterfacePresence {
+        guard result.status == 0, result.output.utf8.count < HelperConstants.maxCommandOutputBytes,
+              let interfaces = parseInterfaces(result.output), interfaces["lo0"]?.flags.contains("LOOPBACK") == true else {
+            return .unknown
+        }
+        return interfaces[name] == nil ? .absent : .present
+    }
+
     /// This exact network and prefix as an unscoped, installed route on this interface. A cached clone does not count.
     public static func routeInstalled(netstat: String, address: String, prefix: Int, on interface: String) -> Bool {
         guard let rows = parseRoutingTable(netstat), let value = ipv4Value(address), (0...32).contains(prefix) else { return false }
