@@ -12,20 +12,36 @@ app="$WORK/app/WireNest.app"
 
 dist="$REPO_ROOT/dist"
 name="WireNest-$version-$arch.dmg"
+final="$dist/$name"
 staging="$WORK/dmg-staging"
+candidate_dir="$WORK/dmg-candidate"
+candidate="$candidate_dir/$name"
 rm -rf "$staging"
+# An earlier build's image or checksum must not survive a failure here.
+rm -f "$final" "$final.sha256"
 mkdir -p "$staging" "$dist"
 ditto "$app" "$staging/WireNest.app"
 ln -s /Applications "$staging/Applications"
 
-# hdiutil on hosted runners intermittently reports "Resource busy", so retry it.
+# Hosted runners have returned "Resource busy" from create, and also a created image that
+# failed verify immediately, so every attempt is a fresh image that must pass verify.
 for attempt in 1 2 3 4 5; do
-  if hdiutil create -volname WireNest -srcfolder "$staging" -fs HFS+ -format UDZO -ov "$dist/$name"; then
+  rm -rf "$candidate_dir"
+  mkdir -p "$candidate_dir"
+  if hdiutil create -volname WireNest -srcfolder "$staging" -fs HFS+ -format UDZO -ov "$candidate" &&
+    hdiutil verify "$candidate"; then
     break
   fi
-  [[ $attempt -lt 5 ]] || die "hdiutil create failed after $attempt attempts"
+  echo "warning: DMG attempt $attempt failed create or verify; discarding it" >&2
+  ls -l "$candidate_dir" >&2
+  rm -rf "$candidate_dir"
+  [[ $attempt -lt 5 ]] || die "no DMG passed create and verify after $attempt attempts"
   sleep $((attempt * 5))
 done
-hdiutil verify "$dist/$name"
-(cd "$dist" && shasum -a 256 "$name" >"$name.sha256")
-echo "Built $dist/$name"
+
+# Same filesystem under the repo, so publishing is a rename of exactly the verified bytes.
+(cd "$candidate_dir" && shasum -a 256 "$name" >"$name.sha256")
+mv "$candidate" "$final"
+mv "$candidate.sha256" "$final.sha256"
+rm -rf "$candidate_dir"
+echo "Built $final"

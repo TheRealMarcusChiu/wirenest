@@ -76,7 +76,8 @@ cp "$GOROOT/LICENSE" "$licenses/go-LICENSE"
 
 echo "==> smoke-test peer (never bundled in the app)"
 mkdir "$wggo_src/smokepeer"
-cp "$REPO_ROOT/scripts/smoke-peer/main.go" "$wggo_src/smokepeer/main.go"
+cp "$REPO_ROOT/scripts/smoke-peer/"*.go "$wggo_src/smokepeer/"
 (cd "$wggo_src" && "$go" build -o "$WORK/smoke-peer" ./smokepeer)
+(cd "$wggo_src" && "$go" test -count=1 -timeout 120s -v ./smokepeer)
 
 ls -l "$out" "$WORK/smoke-peer"

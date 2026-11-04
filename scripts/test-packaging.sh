@@ -194,10 +194,91 @@ fi
 
 # Deliberately not a failure: this step only runs on manual dispatch, so normal CI doesn't need the script.
 if [[ -f scripts/smoke-full-route.sh ]]; then
-  echo "note: scripts/smoke-full-route.sh present; not run by these checks"
+  # --self-test is offline logic only: no root, routing or macOS.
+  if bash scripts/smoke-full-route.sh --self-test >"$scratch/full-route.out" 2>&1; then
+    pass "smoke-full-route.sh offline self-test"
+  else
+    fail "smoke-full-route.sh offline self-test: $(cat "$scratch/full-route.out")"
+  fi
 else
   echo "note: scripts/smoke-full-route.sh not in this checkout; dispatching with full_route_proof=true would fail until it is integrated"
 fi
+
+# DMG publication, using fake tools. This proves make-dmg's control flow, not that hdiutil works.
+dmg_repo="$scratch/dmg"
+mkdir -p "$dmg_repo/scripts" "$dmg_repo/.build/packaging/app/WireNest.app"
+cp scripts/make-dmg.sh scripts/deps.sh "$dmg_repo/scripts/"
+dmg_name="WireNest-9.9.9-$(uname -m).dmg"
+dmg_final="$dmg_repo/dist/$dmg_name"
+dmg_log="$scratch/dmg.log"
+# run_make_dmg SCENARIO: starts with stale files published, which must never survive a run.
+run_make_dmg() (
+  mkdir -p "$dmg_repo/dist"
+  printf stale >"$dmg_final"
+  printf stale >"$dmg_final.sha256"
+  : >"$dmg_log"
+  export FAKE_SCENARIO=$1 FAKE_LOG=$dmg_log
+  hdiutil() {
+    local image=${!#} n
+    echo "$1 $image" >>"$FAKE_LOG"
+    if [[ $1 == verify ]]; then
+      [[ $(cat "$image" 2>/dev/null) == good-* ]]
+      return
+    fi
+    n=$(grep -c '^create ' "$FAKE_LOG")
+    case "$FAKE_SCENARIO:$n" in
+      busy:1) return 1 ;;
+      recover:1 | permanent:*) printf corrupt >"$image" ;;
+      *) printf 'good-%s' "$n" >"$image" ;;
+    esac
+    echo "created: $image"
+  }
+  ditto() { mkdir -p "$2"; }
+  sleep() { :; }
+  export -f hdiutil ditto sleep
+  if ! command -v shasum >/dev/null; then
+    shasum() { sha256sum "$3"; }
+    export -f shasum
+  fi
+  bash "$dmg_repo/scripts/make-dmg.sh" 9.9.9
+)
+dmg_calls() { grep -c "^$1 " "$dmg_log" || true; }
+# dmg_published GOOD_BYTES CREATES VERIFIES: exactly those verified bytes, a matching checksum, no leftovers.
+dmg_published() {
+  [[ $(cat "$dmg_final" 2>/dev/null) == "$1" ]] || return 1
+  [[ $(awk '{print $2}' "$dmg_final.sha256") == "$dmg_name" ]] || return 1
+  check_sha256 "$dmg_final" "$(awk '{print $1}' "$dmg_final.sha256")" || return 1
+  [[ $(dmg_calls create) -eq $2 && $(dmg_calls verify) -eq $3 ]] || return 1
+  ! grep -q "^verify $dmg_repo/dist/" "$dmg_log" && [[ ! -e $dmg_repo/.build/packaging/dmg-candidate ]]
+}
+if run_make_dmg recover >"$scratch/dmg.out" 2>&1 && dmg_published good-2 2 2; then
+  pass "make-dmg recovers from an image that fails verify, and publishes only the verified one"
+else
+  fail "make-dmg did not recover from an image that fails verify: $(cat "$scratch/dmg.out")"
+fi
+if run_make_dmg busy >"$scratch/dmg.out" 2>&1 && dmg_published good-2 2 1; then
+  pass "make-dmg still retries a failed create"
+else
+  fail "make-dmg did not retry a failed create: $(cat "$scratch/dmg.out")"
+fi
+if run_make_dmg permanent >"$scratch/dmg.out" 2>&1; then
+  fail "make-dmg succeeded although every image failed verify"
+elif [[ -e $dmg_final || -e $dmg_final.sha256 ]]; then
+  fail "make-dmg left a published image or checksum after failing"
+elif [[ $(dmg_calls create) -ne 5 || $(dmg_calls verify) -ne 5 ]]; then
+  fail "make-dmg made $(dmg_calls create) creates and $(dmg_calls verify) verifies, expected 5 of each"
+elif [[ -e $dmg_repo/.build/packaging/dmg-candidate ]]; then
+  fail "make-dmg left a failed candidate behind"
+else
+  pass "make-dmg fails after 5 bad images and publishes nothing"
+fi
+
+# The peer's Go tests only run if build-tools copies them next to main.go, in the pinned module.
+grep -Fq 'cp "$REPO_ROOT/scripts/smoke-peer/"*.go "$wggo_src/smokepeer/"' scripts/build-tools.sh &&
+  grep -Fq '"$go" test -count=1 -timeout 120s -v ./smokepeer' scripts/build-tools.sh &&
+  pass "build-tools runs the smoke peer's Go tests" || fail "build-tools does not run the smoke peer's Go tests"
+# Blocked until lane C4's file is integrated: go test exits 0 when there are no test files.
+[[ -f scripts/smoke-peer/bind_test.go ]] && pass "scripts/smoke-peer/bind_test.go present" || fail "scripts/smoke-peer/bind_test.go is missing from this checkout"
 
 [[ $fails -eq 0 ]] || die "$fails check(s) failed"
 echo "All packaging self-checks passed."
