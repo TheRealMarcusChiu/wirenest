@@ -86,7 +86,12 @@ starting its UI.
 - **Install.** As root, copy the whole app into a private 0700 root-owned staging directory, strip
   write bits, and reject anything but regular files and folders. Then verify that snapshot's signature
   (all architectures, nested code, sealed resources), derive the client pin from it, and install only
-  its bytes. Changing the original bundle after the copy cannot affect the result, and an existing
+  its bytes. Copying also carries extended ACLs, which survive `chown` and `chmod` and could keep granting
+  the user write access, so every copied or created item has its ACLs removed, and root ownership, mode and
+  an empty ACL are read back before anything is published; any failure stops the install. The shared
+  `/Library/PrivilegedHelperTools` is checked, not changed: the install stops if anyone but root could
+  write to it. The daemon refuses a client pin that has an ACL. Source files are never changed.
+  Changing the original bundle after the copy cannot affect the result, and an existing
   install is untouched until verification passes and is put back if bootstrap fails. An ad-hoc signature
   proves self-consistency, not authorship: this installs whichever app the administrator chose.
 - **Caller authentication.** The listener's `setConnectionCodeSigningRequirement` pins the CDHash of

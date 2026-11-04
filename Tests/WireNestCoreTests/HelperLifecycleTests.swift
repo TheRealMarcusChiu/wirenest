@@ -483,6 +483,75 @@ final class InstallStagingTests: XCTestCase {
         XCTAssertThrowsError(try stage())
     }
 
+    /// A real ACL through the system tool: unlike mode bits, it survives chown and chmod and keeps granting access.
+    private func grantACL(_ permission: String, on url: URL) throws {
+        let chmod = Process()
+        chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
+        chmod.arguments = ["+a", "\(NSUserName()) allow \(permission)", url.path]
+        try chmod.run()
+        chmod.waitUntilExit()
+        XCTAssertEqual(chmod.terminationStatus, 0)
+        XCTAssertTrue(try SecureFile.hasExtendedACL(url.path), "the fixture must really have an ACL")
+    }
+
+    private func itemsInside(_ directory: URL) throws -> [String] {
+        try [directory.path] + FileManager.default.subpathsOfDirectory(atPath: directory.path).map { directory.appendingPathComponent($0).path }
+    }
+
+    func testRemovingAnACLReallyRemovesIt() throws {
+        let file = tool(app, "wg")
+        try grantACL("write", on: file)
+        try SecureFile.removeExtendedACL(file.path)
+        XCTAssertFalse(try SecureFile.hasExtendedACL(file.path))
+    }
+
+    func testSourceACLsReachNeitherTheVerifiedSnapshotNorTheInstalledPayload() throws {
+        let sourceTool = tool(app, "wg")
+        let sourceTools = sourceTool.deletingLastPathComponent()
+        try grantACL("write", on: sourceTool)
+        try grantACL("add_file", on: sourceTools)
+
+        let payload = try stage { stagedApp in
+            for path in try self.itemsInside(stagedApp) {
+                XCTAssertFalse(try SecureFile.hasExtendedACL(path), path)
+            }
+            return HelperClientPin(ownerUID: 501, appCDHash: "ab")
+        }
+
+        for path in try itemsInside(payload) {
+            XCTAssertFalse(try SecureFile.hasExtendedACL(path), path)
+        }
+        XCTAssertEqual(try Data(contentsOf: payload.appendingPathComponent("Tools/wg")), Data("verified wg".utf8))
+        XCTAssertTrue(try SecureFile.hasExtendedACL(sourceTool.path), "only the copy is ours to change")
+        XCTAssertTrue(try SecureFile.hasExtendedACL(sourceTools.path), "only the copy is ours to change")
+    }
+
+    func testEveryPublishedItemIsSecuredWithItsFinalMode() throws {
+        var secured: [String: mode_t] = [:]
+        let payload = try stageVerifiedInstall(
+            appBundle: app, stagingRoot: stagingRoot,
+            secure: { path, mode in
+                secured[path] = mode
+                guard chmod(path, mode) == 0 else { throw SecureFileError("chmod failed") }
+            },
+            verify: { _ in HelperClientPin(ownerUID: 501, appCDHash: "ab") }
+        )
+        for path in try itemsInside(payload) {
+            let expected: mode_t = path.hasSuffix("client.json") ? 0o644 : 0o755
+            XCTAssertEqual(secured[path], expected, path)
+        }
+    }
+
+    func testFailureToSecureAnItemStopsTheInstall() {
+        XCTAssertThrowsError(try stageVerifiedInstall(
+            appBundle: app, stagingRoot: stagingRoot,
+            secure: { path, _ in
+                if path.hasSuffix("payload/Tools/wg") { throw SecureFileError("cannot secure") }
+            },
+            verify: { _ in HelperClientPin(ownerUID: 501, appCDHash: "ab") }
+        ))
+    }
+
     func testWritableBitsAreStrippedFromTheSnapshotAndPayloadIsExecutable() throws {
         let payload = try stage()
         let mode = (try FileManager.default.attributesOfItem(atPath: payload.appendingPathComponent("Tools/wg").path)[.posixPermissions] as! NSNumber).intValue

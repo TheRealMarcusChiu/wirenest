@@ -19,12 +19,19 @@ public struct AppBundleLayout {
 /// Builds the install payload from a private copy of the app, so everything checked and installed is one
 /// immutable snapshot: once the copy exists, changing the original bundle can no longer affect the install.
 /// `secure` applies root ownership and a mode. `verify` validates the snapshot's signature and derives the client pin.
+/// Copying carries the source's ACLs along, and those could grant write access to what root later runs, so
+/// every copied or created item loses its ACLs. Signatures do not cover ACLs, so the pin is unaffected.
 public func stageVerifiedInstall(
     appBundle: URL, stagingRoot: URL,
     secure: (String, mode_t) throws -> Void,
     verify: (URL) throws -> HelperClientPin
 ) throws -> URL {
     let fm = FileManager.default
+    func protect(_ path: String, _ mode: mode_t) throws {
+        try SecureFile.removeExtendedACL(path)
+        try secure(path, mode)
+    }
+
     try? fm.removeItem(at: stagingRoot)
     try SecureFile.ensurePrivateDirectory(stagingRoot)
     let snapshot = stagingRoot.appendingPathComponent(appBundle.lastPathComponent)
@@ -35,7 +42,7 @@ public func stageVerifiedInstall(
         guard lstat(path, &info) == 0, [S_IFREG, S_IFDIR].contains(info.st_mode & S_IFMT) else {
             throw SecureFileError("WireNest.app contains an item that is not a regular file or folder.")
         }
-        try secure(path, info.st_mode & 0o755)
+        try protect(path, info.st_mode & 0o755)
     }
 
     let pin = try verify(snapshot)
@@ -49,7 +56,7 @@ public func stageVerifiedInstall(
     func install(_ source: URL, as destination: URL) throws {
         try fm.copyItem(at: source, to: destination)
         removexattr(destination.path, "com.apple.quarantine", XATTR_NOFOLLOW)
-        try secure(destination.path, 0o755)
+        try protect(destination.path, 0o755)
     }
     try install(layout.helper, as: payload.appendingPathComponent("WireNestHelper"))
     for tool in HelperConstants.toolNames {
@@ -57,9 +64,9 @@ public func stageVerifiedInstall(
     }
     let pinFile = payload.appendingPathComponent("client.json")
     try SecureFile.store(JSONEncoder().encode(pin), to: pinFile, mode: 0o644)
-    try secure(pinFile.path, 0o644)
-    try secure(payloadTools.path, 0o755)
-    try secure(payload.path, 0o755)
+    try protect(pinFile.path, 0o644)
+    try protect(payloadTools.path, 0o755)
+    try protect(payload.path, 0o755)
     return payload
 }
 

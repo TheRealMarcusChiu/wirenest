@@ -30,7 +30,12 @@ enum Installer {
         let installDir = URL(fileURLWithPath: HelperConstants.installDir)
         let parent = installDir.deletingLastPathComponent()
         try fm.createDirectory(at: parent, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
-        try protect(parent.path, mode: 0o755)
+        // A system directory shared with other apps' helpers: checked and never changed, since an install inside it is only as safe as it is.
+        var parentInfo = stat()
+        guard lstat(parent.path, &parentInfo) == 0, parentInfo.st_mode & S_IFMT == S_IFDIR, parentInfo.st_uid == 0,
+              parentInfo.st_mode & 0o022 == 0, try !SecureFile.hasExtendedACL(parent.path) else {
+            throw InstallError("\(parent.path) can be changed by someone other than root. Fix its permissions and access list, then install again.")
+        }
 
         // The existing install is not touched until the snapshot has passed verification.
         let staging = URL(fileURLWithPath: HelperConstants.installDir + ".staging-\(getpid())")
@@ -62,6 +67,7 @@ enum Installer {
         do {
             try fm.moveItem(at: payload, to: installDir)
             try SecureFile.store(plist, to: plistURL, mode: 0o644)
+            try SecureFile.removeExtendedACL(plistURL.path)
             try protect(plistURL.path, mode: 0o644)
             let bootstrap = start()
             guard bootstrap.status == 0 else { throw InstallError("launchctl bootstrap failed: \(bootstrap.output)") }
@@ -131,6 +137,12 @@ enum Installer {
     private static func protect(_ path: String, mode: mode_t) throws {
         guard lchown(path, 0, 0) == 0, chmod(path, mode) == 0 else {
             throw InstallError("Cannot secure \(path).")
+        }
+        // Read back, including the access list, which neither call above affects.
+        var info = stat()
+        guard lstat(path, &info) == 0, info.st_uid == 0, info.st_gid == 0, info.st_mode & 0o7777 == mode,
+              try !SecureFile.hasExtendedACL(path) else {
+            throw InstallError("\(path) is not protected as required.")
         }
     }
 }

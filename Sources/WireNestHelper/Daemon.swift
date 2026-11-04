@@ -38,7 +38,8 @@ final class HelperService: NSObject, NSXPCListenerDelegate, WireNestHelperXPC {
 func loadClientPin() throws -> HelperClientPin {
     var info = stat()
     guard lstat(HelperConstants.clientPinPath, &info) == 0,
-          info.st_mode & S_IFMT == S_IFREG, info.st_uid == 0, info.st_mode & 0o022 == 0 else {
+          info.st_mode & S_IFMT == S_IFREG, info.st_uid == 0, info.st_mode & 0o022 == 0,
+          try !SecureFile.hasExtendedACL(HelperConstants.clientPinPath) else {
         throw InstallError("The client pin is missing or not protected.")
     }
     let data = try Data(contentsOf: URL(fileURLWithPath: HelperConstants.clientPinPath))
