@@ -32,6 +32,21 @@ final class ConfigParserTests: XCTestCase {
         }
     }
 
+    func testAPairedHostRouteHookIsKeptInStoredTextAndNeverReachesRuntimeText() throws {
+        let preUp = "PreUp = /sbin/route -n add -host 198.51.100.50 192.168.64.1"
+        let postDown = "PostDown = /sbin/route -n delete -host 198.51.100.50 192.168.64.1"
+        let config = try WireGuardConfig.parse(confText(extraInterface: "\(preUp)\n\(postDown)"))
+
+        XCTAssertTrue(config.storedText.contains(preUp), "editing a saved tunnel must not lose it")
+        XCTAssertTrue(config.storedText.contains(postDown))
+        XCTAssertEqual(try WireGuardConfig.parse(config.storedText), config)
+
+        // wg-quick runs these through a root shell, so its file must never hold them.
+        XCTAssertFalse(config.runtimeText.lowercased().contains("preup"))
+        XCTAssertFalse(config.runtimeText.lowercased().contains("postdown"))
+        XCTAssertFalse(config.runtimeText.contains("/sbin/route"))
+    }
+
     func testRejectsUnknownDirectivesInBothSections() {
         assertRejected(confText(extraInterface: "FwMark = 51820"), .unknownDirective)
         assertRejected(confText(extraPeer: "Nonsense = 1"), .unknownDirective)

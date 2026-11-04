@@ -812,6 +812,48 @@ final class GatewayEndpointRootTests: XCTestCase {
         ok(.up(tunnelID: fullID, config: full))
     }
 
+    // MARK: a route the config asks for
+
+    func testASplitTunnelsHookedHostRouteIsAddedBeforeSpawnAndRemovedAfterTheTunnelIsGone() throws {
+        let hooked = "198.51.100.50", gateway = "192.168.64.1"
+        commands.netstatBase = commands.netstatBase.replacingOccurrences(of: "192.168.86", with: "192.168.64")
+        commands.ifconfigAll = commands.ifconfigAll.replacingOccurrences(of: "192.168.86", with: "192.168.64")
+        commands.routeGet[hooked] = CommandResult(status: 0, output: "   route to: \(hooked)\ndestination: default\n       mask: default\n    gateway: \(gateway)\n  interface: en0\n      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>\n")
+        let config = confText(
+            address: "10.20.0.2/32",
+            extraInterface: "PreUp = /sbin/route -n add -host \(hooked) \(gateway)\nPostDown = /sbin/route -n delete -host \(hooked) \(gateway)",
+            allowedIPs: "192.168.111.0/24", endpoint: "\(hooked):12345"
+        )
+
+        var routeAtSpawn: String?, configAtSpawn: String?
+        commands.onQuick = { [unowned self] action in
+            guard action == "up" else { return }
+            routeAtSpawn = self.commands.hostRoutes[hooked]
+            configAtSpawn = try? String(contentsOf: self.paths.runtimeDir.appendingPathComponent("wn0.conf"), encoding: .utf8)
+        }
+        ok(.up(tunnelID: splitID, config: config))
+
+        XCTAssertNotNil(routeAtSpawn, "in place before the tunnel starts, with no default-route tunnel involved")
+        XCTAssertEqual(adds, [["-q", "-n", "add", "-inet", hooked, "-gateway", gateway]], "fixed argv from validated values")
+        let backendConfig = try XCTUnwrap(configAtSpawn)
+        XCTAssertFalse(backendConfig.lowercased().contains("preup"), "wg-quick would run it through a root shell")
+        XCTAssertFalse(backendConfig.lowercased().contains("postdown"))
+        XCTAssertFalse(commands.flatArgv.contains("-host"), "the hook's own text never runs")
+        XCTAssertTrue(running(splitID))
+        XCTAssertNotNil(commands.hostRoutes[hooked], "polling leaves it alone")
+        XCTAssertTrue(deletes.isEmpty)
+
+        var tunnelGoneAtDelete: Bool?
+        commands.onRouteChange = { [unowned self] verb in
+            if verb == "delete" { tunnelGoneAtDelete = self.commands.slots["wn0"] == nil }
+        }
+        ok(.down(tunnelID: splitID))
+        XCTAssertEqual(tunnelGoneAtDelete, true)
+        XCTAssertEqual(deletes, [["-q", "-n", "delete", "-inet", hooked, gateway]])
+        XCTAssertNil(commands.hostRoutes[hooked])
+        XCTAssertFalse(journal.contains(hooked), "nothing of ours is left")
+    }
+
     // MARK: the pair
 
     func testTheDualStackPairRunsInBothOrdersWithFixedArgv() {
