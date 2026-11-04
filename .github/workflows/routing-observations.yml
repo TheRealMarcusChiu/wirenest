@@ -1,0 +1,41 @@
+name: Routing observations
+
+# Read-only evidence from hosted runners. This is not application proof or a release gate.
+on:
+  push:
+    branches: [ci/routing-observations]
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Confirm architecture
+        run: '[ "$(uname -m)" = "$ARCH" ]'
+      - name: Self-test with synthetic fixtures
+        run: bash scripts/observe-routing.sh --self-test
+      - name: Capture read-only observations
+        run: bash scripts/observe-routing.sh routing-observations
+      # Failed captures are evidence too, so upload whatever exists.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: routing-observations-${{ matrix.arch }}
+          path: routing-observations
+          if-no-files-found: error
